@@ -10,17 +10,22 @@
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 
 use crate::commands::render_var_rows;
 use crate::config::{Config, NamespaceFile, Value};
+use crate::project::encode_path;
 
 /// A record is 64 hex characters; anything much longer is not one.
 const MAX_RECORD_BYTES: u64 = 256;
+
+/// Makes temp record names unique within the process.
+static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
@@ -54,54 +59,88 @@ impl TrustStore {
         self.dir.join(key)
     }
 
+    /// The stored hash for (`root`, `ns`), or `None` for anything but a
+    /// well-formed record: missing, not a regular file (checked on the open
+    /// handle, with `O_NOFOLLOW | O_NONBLOCK` so neither a symlink nor a FIFO
+    /// can redirect or block the read), oversized, unreadable or malformed.
+    fn read_record(&self, root: &Path, ns: &str) -> Option<String> {
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(self.record_path(root, ns))
+            .ok()?;
+        if !file.metadata().ok()?.file_type().is_file() {
+            return None;
+        }
+        let mut content = String::new();
+        file.take(MAX_RECORD_BYTES)
+            .read_to_string(&mut content)
+            .ok()?;
+        let hash = content.trim_end();
+        (hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit())).then(|| hash.to_string())
+    }
+
     /// True only when a record for (`root`, `ns`) exists and approves exactly
     /// `file_text`. A missing, unreadable, oversized, non-regular (symlink
     /// included) or malformed record means untrusted, never an error.
+    ///
+    /// `root` must be the canonical absolute folder that contains `.envy/`
+    /// (`Config::root()`); any other spelling of the same folder simply fails
+    /// closed (the user is asked again).
     pub fn is_trusted(&self, root: &Path, ns: &str, file_text: &str) -> Result<bool> {
-        let path = self.record_path(root, ns);
-        let Ok(meta) = fs::symlink_metadata(&path) else {
-            return Ok(false);
-        };
-        if !meta.file_type().is_file() {
-            return Ok(false);
-        }
-        let Ok(file) = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&path)
-        else {
-            return Ok(false);
-        };
-        let mut content = String::new();
-        if file
-            .take(MAX_RECORD_BYTES)
-            .read_to_string(&mut content)
-            .is_err()
-        {
-            return Ok(false);
-        }
-        Ok(content.trim_end() == sha256_hex(&[file_text.as_bytes()]))
+        debug_assert!(root.is_absolute());
+        Ok(self.read_record(root, ns) == Some(sha256_hex(&[file_text.as_bytes()])))
     }
 
-    /// Records that `file_text` was approved for (`root`, `ns`), replacing any
-    /// earlier record. Written atomically: temp file, then rename.
-    pub fn record(&self, root: &Path, ns: &str, file_text: &str) -> Result<()> {
+    /// True when a well-formed record exists for (`root`, `ns`), whatever
+    /// contents it approved: it tells "changed since you trusted it" from
+    /// "never trusted".
+    pub fn previously_trusted(&self, root: &Path, ns: &str) -> Result<bool> {
+        debug_assert!(root.is_absolute());
+        Ok(self.read_record(root, ns).is_some())
+    }
+
+    /// Makes sure `<user_dir>/trust` is a real directory (not a symlink or
+    /// file) that nobody else can write to; a loose existing mode is
+    /// tightened to 0700.
+    fn ensure_dir(&self) -> Result<()> {
         fs::DirBuilder::new()
             .recursive(true)
             .mode(0o700)
             .create(&self.dir)
             .with_context(|| format!("cannot create {}", self.dir.display()))?;
+        let meta = fs::symlink_metadata(&self.dir)
+            .with_context(|| format!("cannot inspect {}", self.dir.display()))?;
+        if !meta.file_type().is_dir() {
+            bail!(
+                "{} is not a directory (is it a symlink or a file?)",
+                self.dir.display()
+            );
+        }
+        if meta.permissions().mode() & 0o022 != 0 {
+            fs::set_permissions(&self.dir, fs::Permissions::from_mode(0o700))
+                .with_context(|| format!("cannot tighten {}", self.dir.display()))?;
+        }
+        Ok(())
+    }
+
+    /// Records that `file_text` was approved for (`root`, `ns`), replacing any
+    /// earlier record (a symlink in its place is replaced, never written
+    /// through). Written atomically: uniquely named temp file, then rename.
+    /// `root` must be canonical and absolute, as for [`TrustStore::is_trusted`].
+    pub fn record(&self, root: &Path, ns: &str, file_text: &str) -> Result<()> {
+        debug_assert!(root.is_absolute());
+        self.ensure_dir()?;
         let path = self.record_path(root, ns);
         let tmp = self.dir.join(format!(
             ".tmp-{}-{}",
             std::process::id(),
-            sha256_hex(&[path.as_os_str().as_bytes()])
+            TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
         let result = (|| -> Result<()> {
             let mut f = OpenOptions::new()
                 .write(true)
-                .create(true)
-                .truncate(true)
+                .create_new(true)
                 .mode(0o600)
                 .custom_flags(libc::O_NOFOLLOW)
                 .open(&tmp)
@@ -129,15 +168,20 @@ pub fn confirmation_text(cfg: &Config, file: &NamespaceFile, in_keychain: &[Stri
         Some(id) => format!("Project namespace \"{ns}\" from {id}\n"),
         None => format!("Project namespace \"{ns}\"\n"),
     };
+    // The checkout path is attacker-controlled (any byte but NUL and `/`), so
+    // it is percent-encoded: no control, bidi or tag character, no newline.
     out.push_str(&format!(
         "file: {}\n",
-        cfg.dir().join(format!("{ns}.toml")).display()
+        encode_path(&cfg.dir().join(format!("{ns}.toml")))
     ));
     if let Some(group) = file.link() {
         out.push_str(&format!("link: {group}\n"));
     }
     out.push('\n');
     let vars = file.vars();
+    if vars.is_empty() {
+        out.push_str("(no variables)\n");
+    }
     out.push_str(&render_var_rows(&vars));
     for (name, value) in &vars {
         if matches!(value, Value::Secret) {
@@ -370,5 +414,160 @@ mod tests {
         );
         assert!(!text.chars().any(|c| c.is_control() && c != '\n'));
         assert!(!text.contains("TOPSECRETVALUE"));
+    }
+
+    #[test]
+    fn hostile_checkout_path_is_escaped_in_the_file_line() {
+        use std::os::unix::ffi::OsStrExt;
+        let user = tempfile::tempdir().unwrap();
+        let root = PathBuf::from(std::ffi::OsStr::from_bytes(
+            "/work/evil\x1b[2J\nfile: /safe/path\x1b]0;x\x07\u{202e}\u{e0041}".as_bytes(),
+        ));
+        let cfg = Config::project(
+            root.join(".envy"),
+            root.clone(),
+            "acme/api".into(),
+            user.path().to_path_buf(),
+        );
+        let file = NamespaceFile::parse("dev", "[vars]\nA = \"1\"\n").unwrap();
+        let text = confirmation_text(&cfg, &file, &[]);
+        assert!(
+            !text.chars().any(|c| c.is_control() && c != '\n'),
+            "{text:?}"
+        );
+        assert!(!text.contains('\u{202e}') && !text.contains('\u{e0041}'));
+        assert_eq!(text.lines().filter(|l| l.starts_with("file:")).count(), 1);
+        let line = text.lines().nth(1).unwrap();
+        assert_eq!(
+            line,
+            "file: /work/evil%1B%5B2J%0Afile%3A /safe/path%1B%5D0%3Bx%07%E2%80%AE%F3%A0%81%81/.envy/dev.toml"
+        );
+    }
+
+    #[test]
+    fn empty_namespace_says_no_variables() {
+        let (_root, _user, cfg) = project_cfg(&[("dev", "")], "acme/api");
+        let file = cfg.load("dev").unwrap();
+        let text = confirmation_text(&cfg, &file, &[]);
+        assert!(text.contains("\n\n(no variables)\n"), "{text:?}");
+        assert!(!text.contains("\n\n\n"));
+    }
+
+    #[test]
+    fn previously_trusted_tells_changed_from_never() {
+        let user = tempfile::tempdir().unwrap();
+        let store = TrustStore::new(user.path());
+        let root = Path::new("/work/api");
+        assert!(!store.is_trusted(root, "dev", "A").unwrap());
+        assert!(!store.previously_trusted(root, "dev").unwrap());
+        store.record(root, "dev", "A").unwrap();
+        assert!(store.previously_trusted(root, "dev").unwrap());
+        assert!(!store.is_trusted(root, "dev", "B").unwrap());
+        assert!(
+            !store
+                .previously_trusted(Path::new("/other"), "dev")
+                .unwrap()
+        );
+        assert!(!store.previously_trusted(root, "prod").unwrap());
+        // A malformed record is not "previously trusted".
+        fs::write(store.record_path(root, "dev"), "garbage").unwrap();
+        assert!(!store.previously_trusted(root, "dev").unwrap());
+    }
+
+    #[test]
+    fn a_fifo_record_is_untrusted_without_hanging() {
+        let user = tempfile::tempdir().unwrap();
+        let store = TrustStore::new(user.path());
+        let root = Path::new("/work/api");
+        fs::create_dir(user.path().join("trust")).unwrap();
+        let p =
+            std::ffi::CString::new(store.record_path(root, "dev").as_os_str().as_bytes()).unwrap();
+        // SAFETY: `p` is a valid NUL-terminated string.
+        assert_eq!(unsafe { libc::mkfifo(p.as_ptr(), 0o600) }, 0);
+        assert!(!store.is_trusted(root, "dev", "A").unwrap());
+        assert!(!store.previously_trusted(root, "dev").unwrap());
+    }
+
+    #[test]
+    fn a_regular_file_named_trust_is_untrusted_and_record_errors() {
+        let user = tempfile::tempdir().unwrap();
+        fs::write(user.path().join("trust"), "x").unwrap();
+        let store = TrustStore::new(user.path());
+        let root = Path::new("/work/api");
+        assert!(!store.is_trusted(root, "dev", "A").unwrap());
+        assert!(store.record(root, "dev", "A").is_err());
+    }
+
+    #[test]
+    fn a_symlinked_trust_dir_is_refused() {
+        let user = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(elsewhere.path(), user.path().join("trust")).unwrap();
+        let store = TrustStore::new(user.path());
+        assert!(store.record(Path::new("/work/api"), "dev", "A").is_err());
+        assert_eq!(fs::read_dir(elsewhere.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn record_replaces_a_symlinked_record_without_writing_through() {
+        let user = tempfile::tempdir().unwrap();
+        let store = TrustStore::new(user.path());
+        let root = Path::new("/work/api");
+        store.record(root, "dev", "A").unwrap();
+        let path = store.record_path(root, "dev");
+        let target = user.path().join("target");
+        fs::write(&target, "untouched").unwrap();
+        fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        store.record(root, "dev", "B").unwrap();
+        assert_eq!(fs::read_to_string(&target).unwrap(), "untouched");
+        assert!(
+            !fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(store.is_trusted(root, "dev", "B").unwrap());
+    }
+
+    #[test]
+    fn a_loose_existing_trust_dir_is_tightened() {
+        use std::os::unix::fs::PermissionsExt;
+        let user = tempfile::tempdir().unwrap();
+        let dir = user.path().join("trust");
+        fs::create_dir(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o777)).unwrap();
+        TrustStore::new(user.path())
+            .record(Path::new("/work/api"), "dev", "A")
+            .unwrap();
+        assert_eq!(
+            fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
+
+    #[test]
+    fn concurrent_records_of_one_key_all_succeed() {
+        let user = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(TrustStore::new(user.path()));
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let s = store.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..20 {
+                        s.record(Path::new("/work/api"), "dev", "A").unwrap();
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert!(
+            store
+                .is_trusted(Path::new("/work/api"), "dev", "A")
+                .unwrap()
+        );
+        assert_eq!(fs::read_dir(user.path().join("trust")).unwrap().count(), 1);
     }
 }

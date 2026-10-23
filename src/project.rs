@@ -97,7 +97,7 @@ pub fn identity_for_root(root: &Path, home: &Path) -> String {
 
 /// Percent-encodes every byte except ASCII letters, digits, `-_.+`, space and
 /// the `/` separator, so distinct paths always give distinct strings.
-fn encode_path(path: &Path) -> String {
+pub(crate) fn encode_path(path: &Path) -> String {
     let mut out = String::new();
     for &b in path.as_os_str().as_bytes() {
         if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'+' | b' ' | b'/') {
