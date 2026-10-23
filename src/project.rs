@@ -81,10 +81,13 @@ pub fn identity_from_url(url: &str) -> Option<String> {
 /// never contain `~` or start with `/`, so the two kinds cannot collide.
 pub fn identity_for_root(root: &Path, home: &Path) -> String {
     let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-    if let Some(id) = remote_identity(&root) {
+    let home = home.canonicalize().unwrap_or_else(|_| home.to_path_buf());
+    // Inside home, a `.git` at home or above (a dotfiles repo) must not lend
+    // its identity to unrelated projects, so only look strictly below home.
+    let floor = root.starts_with(&home).then_some(home.as_path());
+    if let Some(id) = remote_identity(&root, floor) {
         return id;
     }
-    let home = home.canonicalize().unwrap_or_else(|_| home.to_path_buf());
     match root.strip_prefix(&home) {
         Ok(rel) if rel.as_os_str().is_empty() => "~".to_string(),
         Ok(rel) => format!("~/{}", encode_path(rel)),
@@ -106,8 +109,8 @@ fn encode_path(path: &Path) -> String {
     out
 }
 
-fn remote_identity(root: &Path) -> Option<String> {
-    let remotes = remote_urls(&find_git_dirs(root)?);
+fn remote_identity(root: &Path, floor: Option<&Path>) -> Option<String> {
+    let remotes = remote_urls(&find_git_dirs(root, floor)?);
     ["upstream", "origin"].iter().find_map(|name| {
         remotes
             .get(*name)
@@ -137,8 +140,11 @@ fn read_small(path: &Path) -> Option<String> {
 /// whose `config` files apply, the git directory first and then the common
 /// directory. The nearest `.git` wins even if it is unusable (then there is no
 /// remote), matching the spec. `None` when there is no repository.
-fn find_git_dirs(start: &Path) -> Option<Vec<PathBuf>> {
-    let dir = start.ancestors().find(|d| d.join(".git").exists())?;
+fn find_git_dirs(start: &Path, floor: Option<&Path>) -> Option<Vec<PathBuf>> {
+    let dir = start
+        .ancestors()
+        .take_while(|d| Some(*d) != floor)
+        .find(|d| d.join(".git").exists())?;
     let dot_git = dir.join(".git");
     let git_dir = if dot_git.is_dir() {
         dot_git
@@ -657,5 +663,35 @@ mod tests {
         // SAFETY: `path` is a valid NUL-terminated string.
         assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
         assert_eq!(identity_for_root(&root, &home), "~/Source/app");
+    }
+
+    fn dotfiles_remote(dir: &Path) {
+        write_git_config(dir, &origin("git@github.com:me/dotfiles.git"));
+    }
+
+    #[test]
+    fn a_git_dir_at_or_above_home_is_ignored_for_roots_inside_home() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path().canonicalize().unwrap();
+        let home = base.join("home");
+        let p = home.join("p");
+        fs::create_dir_all(&p).unwrap();
+        dotfiles_remote(&home);
+        dotfiles_remote(&base);
+        assert_eq!(identity_for_root(&p, &home), "~/p");
+        write_git_config(&p, &origin("git@github.com:acme/api.git"));
+        assert_eq!(identity_for_root(&p, &home), "acme/api");
+    }
+
+    #[test]
+    fn a_repo_above_home_still_applies_outside_home() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path().canonicalize().unwrap();
+        let home = base.join("home");
+        fs::create_dir_all(&home).unwrap();
+        let outside = base.join("work/sub");
+        fs::create_dir_all(&outside).unwrap();
+        write_git_config(&base.join("work"), &origin("git@github.com:acme/api.git"));
+        assert_eq!(identity_for_root(&outside, &home), "acme/api");
     }
 }

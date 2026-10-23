@@ -3,9 +3,10 @@
 
 use std::collections::HashSet;
 use std::fs;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
 
 use crate::config::Config;
 use crate::project::identity_for_root;
@@ -50,8 +51,7 @@ impl Levels {
     /// is never a project; elsewhere it runs to the filesystem root. A `.envy`
     /// symlink is ignored so a cloned repo cannot point at another directory.
     pub fn discover(cwd: &Path, home: &Path, user: Config) -> Result<Levels> {
-        let cwd = canonical(cwd);
-        let home = canonical(home);
+        let (cwd, home) = resolve_paths(cwd, home)?;
         let inside_home = cwd.starts_with(&home);
         let mut projects = Vec::new();
         for dir in cwd.ancestors() {
@@ -59,7 +59,14 @@ impl Levels {
                 break;
             }
             let envy = dir.join(".envy");
-            let is_dir = fs::symlink_metadata(&envy).is_ok_and(|m| m.file_type().is_dir());
+            let is_dir = match fs::symlink_metadata(&envy) {
+                Ok(m) => m.file_type().is_dir(),
+                Err(e) if e.kind() == ErrorKind::NotFound => false,
+                // Fail closed: an unreadable ancestor may hide a project level.
+                Err(e) => {
+                    return Err(e).with_context(|| format!("cannot access {}", envy.display()));
+                }
+            };
             if is_dir {
                 projects.push(Config::project(
                     envy,
@@ -80,7 +87,9 @@ impl Levels {
     pub fn resolve(&self, ns: &str, force_user: bool) -> Result<Resolved<'_>> {
         if !force_user {
             for project in &self.projects {
-                if project.exists(ns)? {
+                // `present`, not `exists`: a directory or dangling symlink
+                // must win (and fail on load), never fall through to the user.
+                if project.present(ns)? {
                     return Ok(Resolved {
                         cfg: project,
                         shadows_user: self.user.exists(ns)?,
@@ -105,28 +114,39 @@ impl Levels {
     /// The `.envy/` level for `--project`: at the git repository root when
     /// `cwd` is inside one (a `.git` directory or file), else at `cwd`.
     /// Nothing is created on disk.
-    pub fn new_project_level(cwd: &Path, home: &Path, user: &Config) -> Config {
-        let cwd = canonical(cwd);
-        let root = cwd
-            .ancestors()
-            .find(|dir| fs::symlink_metadata(dir.join(".git")).is_ok())
-            .unwrap_or(&cwd)
-            .to_path_buf();
-        Config::project(
+    pub fn new_project_level(cwd: &Path, home: &Path, user: &Config) -> Result<Config> {
+        let (cwd, home) = resolve_paths(cwd, home)?;
+        let has_git = |dir: &&Path| fs::symlink_metadata(dir.join(".git")).is_ok();
+        let root = if cwd.starts_with(&home) {
+            // Home itself (and anything above) is never a project root, so a
+            // dotfiles repo at `~/.git` is ignored.
+            cwd.ancestors().take_while(|d| *d != home).find(has_git)
+        } else {
+            cwd.ancestors().find(has_git)
+        }
+        .unwrap_or(&cwd)
+        .to_path_buf();
+        if root == home {
+            bail!(
+                "cannot create a project level in your home directory; cd into a project folder first"
+            );
+        }
+        Ok(Config::project(
             root.join(".envy"),
             root.clone(),
-            identity_for_root(&root, home),
+            identity_for_root(&root, &home),
             user.dir().to_path_buf(),
-        )
+        ))
     }
 
     /// Every namespace of every project level (nearest first), then the user
     /// level; names within a level are sorted.
     pub fn entries(&self) -> Result<Vec<Entry>> {
+        // An unreadable level fails the whole listing on purpose (fail closed).
         let mut seen = HashSet::new();
         let mut out = Vec::new();
         for project in &self.projects {
-            for name in project.list()? {
+            for name in project.list_present()? {
                 let shadowed = !seen.insert(name.clone());
                 out.push(Entry {
                     name,
@@ -149,8 +169,21 @@ impl Levels {
     }
 }
 
-fn canonical(path: &Path) -> PathBuf {
-    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+/// Both paths must be absolute and resolvable; anything else is an error so
+/// the home boundary can never be silently skipped.
+fn resolve_paths(cwd: &Path, home: &Path) -> Result<(PathBuf, PathBuf)> {
+    for p in [cwd, home] {
+        if !p.is_absolute() {
+            bail!("{} is not an absolute path", p.display());
+        }
+    }
+    let cwd = cwd
+        .canonicalize()
+        .with_context(|| format!("cannot resolve {}", cwd.display()))?;
+    let home = home
+        .canonicalize()
+        .with_context(|| format!("cannot resolve {}", home.display()))?;
+    Ok((cwd, home))
 }
 
 #[cfg(test)]
@@ -222,9 +255,15 @@ mod tests {
     fn discovery_stops_before_home() {
         let f = fixture();
         fs::create_dir_all(f.home.join(".envy")).unwrap();
+        let above = f.home.parent().unwrap().join(".envy");
+        put(&above, "dev", "A = \"1\"\n");
+        put(&f.user_dir, "dev", "A = \"2\"\n");
         let cwd = f.mkdir("work/proj");
-        assert!(dirs(&f.levels(&cwd)).is_empty());
-        assert!(dirs(&f.levels(&f.home)).is_empty());
+        for c in [&cwd, &f.home] {
+            let l = f.levels(c);
+            assert!(dirs(&l).is_empty());
+            assert!(!l.resolve("dev", false).unwrap().cfg.is_project());
+        }
     }
 
     #[test]
@@ -324,7 +363,11 @@ mod tests {
         let r = l.resolve("dev", false).unwrap();
         assert!(r.cfg.is_project());
         let err = format!("{:#}", r.cfg.load("dev").unwrap_err());
-        assert!(err.contains("dev"), "{err}");
+        assert!(err.contains("invalid TOML"), "{err}");
+        assert!(
+            err.contains(&cwd.join(".envy/dev.toml").display().to_string()),
+            "{err}"
+        );
     }
 
     #[test]
@@ -381,14 +424,14 @@ mod tests {
         .unwrap();
         let sub = f.mkdir("repo/src/deep");
         let user = f.user();
-        let c = Levels::new_project_level(&sub, &f.home, &user);
+        let c = Levels::new_project_level(&sub, &f.home, &user).unwrap();
         assert_eq!(c.dir(), repo.join(".envy"));
         assert_eq!(c.root(), Some(repo.as_path()));
         assert_eq!(c.identity(), Some("acme/api"));
         assert!(!repo.join(".envy").exists());
 
         let loose = f.mkdir("loose");
-        let c = Levels::new_project_level(&loose, &f.home, &user);
+        let c = Levels::new_project_level(&loose, &f.home, &user).unwrap();
         assert_eq!(c.dir(), loose.join(".envy"));
         assert_eq!(c.identity(), Some("~/loose"));
         assert_eq!(c.user_dir(), f.user_dir);
@@ -396,7 +439,147 @@ mod tests {
 
         let worktree = f.mkdir("wt/x");
         fs::write(f.home.join("wt/.git"), "gitdir: elsewhere\n").unwrap();
-        let c = Levels::new_project_level(&worktree, &f.home, &user);
+        let c = Levels::new_project_level(&worktree, &f.home, &user).unwrap();
         assert_eq!(c.dir(), f.home.join("wt/.envy"));
+    }
+
+    fn is_root() -> bool {
+        std::process::Command::new("id")
+            .arg("-u")
+            .output()
+            .map(|o| o.stdout == b"0\n")
+            .unwrap_or(false)
+    }
+
+    /// A bad `.envy/dev.toml` of some kind, with a valid user `dev`: it must
+    /// still win (fail closed) and fail on load.
+    fn check_bad_entry(setup: impl Fn(&Path, &Path)) {
+        let f = fixture();
+        let cwd = f.mkdir("p");
+        let envy = cwd.join(".envy");
+        fs::create_dir_all(&envy).unwrap();
+        setup(&envy, &envy.join("dev.toml"));
+        put(&f.user_dir, "dev", "A = \"2\"\n");
+        let l = f.levels(&cwd);
+        let r = l.resolve("dev", false).unwrap();
+        assert!(r.cfg.is_project() && r.shadows_user);
+        assert!(r.cfg.load("dev").is_err());
+        assert!(!l.resolve("dev", true).unwrap().cfg.is_project());
+        let e = l.entries().unwrap();
+        assert_eq!(e[0].name, "dev");
+        assert!(matches!(e[0].level, Level::Project { .. }) && !e[0].shadowed);
+        assert!(e[1].shadowed);
+    }
+
+    #[test]
+    fn project_entry_that_is_a_directory_fails_closed() {
+        check_bad_entry(|_, p| fs::create_dir(p).unwrap());
+    }
+
+    #[test]
+    fn project_entry_that_is_a_dangling_symlink_fails_closed() {
+        check_bad_entry(|_, p| symlink("/nonexistent/nowhere", p).unwrap());
+    }
+
+    #[test]
+    fn project_entry_that_is_a_symlink_to_a_valid_file_fails_closed() {
+        check_bad_entry(|d, p| {
+            let t = d.parent().unwrap().join("real.toml");
+            fs::write(&t, "A = \"1\"\n").unwrap();
+            symlink(&t, p).unwrap();
+        });
+    }
+
+    #[test]
+    fn project_entry_that_is_garbage_fails_closed() {
+        check_bad_entry(|_, p| fs::write(p, "not [toml").unwrap());
+    }
+
+    #[test]
+    fn project_entry_that_is_unreadable_fails_closed() {
+        use std::os::unix::fs::PermissionsExt;
+        if is_root() {
+            return;
+        }
+        check_bad_entry(|_, p| {
+            fs::write(p, "A = \"1\"\n").unwrap();
+            fs::set_permissions(p, fs::Permissions::from_mode(0o000)).unwrap();
+        });
+    }
+
+    #[test]
+    fn discover_refuses_relative_or_unresolvable_paths() {
+        let f = fixture();
+        let cwd = f.mkdir("p");
+        assert!(Levels::discover(Path::new("rel/dir"), &f.home, f.user()).is_err());
+        assert!(Levels::discover(&cwd, Path::new("relhome"), f.user()).is_err());
+        let gone = f.home.join("gone");
+        assert!(Levels::discover(&gone, &f.home, f.user()).is_err());
+        assert!(Levels::discover(&cwd, &f.home.join("nohome"), f.user()).is_err());
+    }
+
+    #[test]
+    fn an_unreadable_envy_probe_fails_closed() {
+        use std::os::unix::fs::PermissionsExt;
+        if is_root() {
+            return;
+        }
+        let f = fixture();
+        let cwd = f.mkdir("p");
+        fs::set_permissions(&cwd, fs::Permissions::from_mode(0o600)).unwrap();
+        let r = Levels::discover(&cwd, &f.home, f.user());
+        fs::set_permissions(&cwd, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn cwd_inside_a_symlinked_directory_is_resolved() {
+        let f = fixture();
+        let real = f.mkdir("real/sub");
+        fs::create_dir_all(f.home.join("real/.envy")).unwrap();
+        symlink(f.home.join("real"), f.home.join("link")).unwrap();
+        let l = f.levels(&f.home.join("link/sub"));
+        assert_eq!(dirs(&l), vec![f.home.join("real/.envy")]);
+        let _ = real;
+    }
+
+    #[test]
+    fn an_envy_symlink_to_a_file_is_not_a_level() {
+        let f = fixture();
+        let cwd = f.mkdir("p");
+        fs::write(f.home.join("target"), "x").unwrap();
+        symlink(f.home.join("target"), cwd.join(".envy")).unwrap();
+        assert!(dirs(&f.levels(&cwd)).is_empty());
+    }
+
+    #[test]
+    fn new_project_level_never_targets_home() {
+        let f = fixture();
+        let user = f.user();
+        fs::create_dir_all(f.home.join(".git")).unwrap();
+        fs::write(
+            f.home.join(".git/config"),
+            "[remote \"origin\"]\n\turl = git@github.com:me/dotfiles.git\n",
+        )
+        .unwrap();
+        let p = f.mkdir("p");
+        let c = Levels::new_project_level(&p, &f.home, &user).unwrap();
+        assert_eq!(c.dir(), p.join(".envy"));
+        assert_eq!(c.identity(), Some("~/p"));
+        assert!(Levels::new_project_level(&f.home, &f.home, &user).is_err());
+    }
+
+    #[test]
+    fn new_project_level_outside_home() {
+        let f = fixture();
+        let user = f.user();
+        let base = f.home.parent().unwrap().join("other");
+        let sub = base.join("repo/src");
+        fs::create_dir_all(&sub).unwrap();
+        let c = Levels::new_project_level(&sub, &f.home, &user).unwrap();
+        assert_eq!(c.dir(), sub.join(".envy"));
+        fs::create_dir_all(base.join("repo/.git")).unwrap();
+        let c = Levels::new_project_level(&sub, &f.home, &user).unwrap();
+        assert_eq!(c.dir(), base.join("repo/.envy"));
     }
 }

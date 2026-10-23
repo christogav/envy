@@ -472,6 +472,17 @@ impl Config {
 
     /// Sorted names of the namespace files; stray files are ignored.
     pub fn list(&self) -> Result<Vec<String>> {
+        self.list_names(true)
+    }
+
+    /// Like `list`, but includes every `*.toml` entry with a valid namespace
+    /// stem whatever its type (directory, symlink, ...). Project levels use
+    /// this so a bad entry is reported instead of hidden.
+    pub fn list_present(&self) -> Result<Vec<String>> {
+        self.list_names(false)
+    }
+
+    fn list_names(&self, files_only: bool) -> Result<Vec<String>> {
         let entries = match fs::read_dir(&self.dir) {
             Ok(entries) => entries,
             Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
@@ -484,7 +495,7 @@ impl Config {
             let Some(stem) = file_name.to_str().and_then(|n| n.strip_suffix(".toml")) else {
                 continue;
             };
-            if validate_namespace(stem).is_ok() && entry.path().is_file() {
+            if validate_namespace(stem).is_ok() && (!files_only || entry.path().is_file()) {
                 names.push(stem.to_string());
             }
         }
@@ -501,16 +512,48 @@ impl Config {
         }
     }
 
+    /// Whether any directory entry exists for `name` (a file, directory,
+    /// dangling symlink, ...). Unlike `exists` it never follows symlinks, so
+    /// project levels use it to fail closed on anything odd.
+    pub fn present(&self, name: &str) -> Result<bool> {
+        let path = self.path_for(name)?;
+        match fs::symlink_metadata(&path) {
+            Ok(_) => Ok(true),
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e).with_context(|| format!("cannot access namespace {name:?}")),
+        }
+    }
+
     pub fn load(&self, name: &str) -> Result<NamespaceFile> {
         let path = self.path_for(name)?;
+        let project = self.is_project();
+        if project && fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink()) {
+            bail!(
+                "refusing project namespace {name:?} ({}): it is a symlink",
+                path.display()
+            );
+        }
         let text = match fs::read_to_string(&path) {
             Ok(text) => text,
             Err(e) if e.kind() == ErrorKind::NotFound => {
                 bail!("namespace {name:?} does not exist (use --new to create it)")
             }
+            Err(e) if project => {
+                return Err(e).with_context(|| {
+                    format!(
+                        "cannot read project namespace {name:?} ({})",
+                        path.display()
+                    )
+                });
+            }
             Err(e) => return Err(e).with_context(|| format!("cannot read namespace {name:?}")),
         };
-        let mut file = NamespaceFile::parse(name, &text)?;
+        let mut file = if project {
+            NamespaceFile::parse(name, &text)
+                .map_err(|e| anyhow::anyhow!("{e} ({})", path.display()))?
+        } else {
+            NamespaceFile::parse(name, &text)?
+        };
         file.secret_key = self.secret_key(name);
         Ok(file)
     }
@@ -592,6 +635,57 @@ fn dir_from_env(config_dir: Option<OsString>, home: Option<OsString>) -> Result<
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn project_load_refuses_a_symlinked_file_and_names_the_path() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cfg = project_cfg(tmp.path(), "acme/api");
+        fs::create_dir_all(cfg.dir()).unwrap();
+        let real = tmp.path().join("real.toml");
+        fs::write(&real, "[vars]\nA = \"1\"\n").unwrap();
+        let link = cfg.dir().join("dev.toml");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let err = format!("{:#}", cfg.load("dev").unwrap_err());
+        assert!(
+            err.contains("symlink") && err.contains(&link.display().to_string()),
+            "{err}"
+        );
+        assert!(cfg.present("dev").unwrap());
+        // The user level is unchanged: it still follows symlinks.
+        let user = Config::new(cfg.dir().to_path_buf());
+        assert!(user.load("dev").is_ok());
+    }
+
+    #[test]
+    fn project_load_errors_name_the_path_not_the_contents() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cfg = project_cfg(tmp.path(), "acme/api");
+        fs::create_dir_all(cfg.dir()).unwrap();
+        let p = cfg.dir().join("dev.toml");
+        fs::write(&p, "SECRET_VALUE = [oops").unwrap();
+        let err = format!("{:#}", cfg.load("dev").unwrap_err());
+        assert!(
+            err.contains(&p.display().to_string()) && !err.contains("SECRET_VALUE"),
+            "{err}"
+        );
+        fs::remove_file(&p).unwrap();
+        fs::create_dir(&p).unwrap();
+        let err = format!("{:#}", cfg.load("dev").unwrap_err());
+        assert!(err.contains(&p.display().to_string()), "{err}");
+    }
+
+    #[test]
+    fn present_sees_any_directory_entry() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cfg = project_cfg(tmp.path(), "acme/api");
+        fs::create_dir_all(cfg.dir()).unwrap();
+        assert!(!cfg.present("dev").unwrap());
+        std::os::unix::fs::symlink("/nonexistent/x", cfg.dir().join("dev.toml")).unwrap();
+        assert!(cfg.present("dev").unwrap() && !cfg.exists("dev").unwrap());
+        fs::create_dir(cfg.dir().join("ci.toml")).unwrap();
+        assert_eq!(cfg.list_present().unwrap(), vec!["ci", "dev"]);
+        assert!(cfg.list().unwrap().is_empty());
+    }
 
     const SAMPLE: &str = "link = \"aws\"\n\n[vars]\nAWS_REGION = \"eu-west-1\"\nGITHUB_TOKEN = \"@keychain\"\nA = \"x\"\n";
 
