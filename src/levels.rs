@@ -1,0 +1,402 @@
+//! Discovery of the project levels (`.envy/` folders) above a directory, and
+//! resolution of a namespace name to exactly one level.
+
+use std::collections::HashSet;
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use anyhow::Result;
+
+use crate::config::Config;
+use crate::project::identity_for_root;
+
+/// Every `.envy/` level above a directory (nearest first), then the user level.
+pub struct Levels {
+    projects: Vec<Config>,
+    user: Config,
+}
+
+/// The level a namespace name resolved to.
+pub struct Resolved<'a> {
+    pub cfg: &'a Config,
+    /// The level is a project one and the user level also has the name.
+    pub shadows_user: bool,
+}
+
+/// Where a listed namespace lives.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Level {
+    Project { dir: PathBuf },
+    User,
+}
+
+/// One namespace in the status listing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Entry {
+    pub name: String,
+    pub level: Level,
+    /// A nearer level already provides this name.
+    pub shadowed: bool,
+}
+
+/// The stderr line printed when a project namespace hides a user one.
+pub fn shadow_note(ns: &str) -> String {
+    format!("note: project namespace {ns:?} shadows your user-level {ns:?}; use --user for yours")
+}
+
+impl Levels {
+    /// Walks up from `cwd` (nearest first, `cwd` included) collecting real
+    /// `.envy` directories. Inside `home` the walk stops before `home`, which
+    /// is never a project; elsewhere it runs to the filesystem root. A `.envy`
+    /// symlink is ignored so a cloned repo cannot point at another directory.
+    pub fn discover(cwd: &Path, home: &Path, user: Config) -> Result<Levels> {
+        let cwd = canonical(cwd);
+        let home = canonical(home);
+        let inside_home = cwd.starts_with(&home);
+        let mut projects = Vec::new();
+        for dir in cwd.ancestors() {
+            if inside_home && dir == home {
+                break;
+            }
+            let envy = dir.join(".envy");
+            let is_dir = fs::symlink_metadata(&envy).is_ok_and(|m| m.file_type().is_dir());
+            if is_dir {
+                projects.push(Config::project(
+                    envy,
+                    dir.to_path_buf(),
+                    identity_for_root(dir, &home),
+                    user.dir().to_path_buf(),
+                ));
+            }
+        }
+        Ok(Levels { projects, user })
+    }
+
+    /// The level that provides `ns`: the nearest project level with the file,
+    /// else the user level (which is also the answer when no level has it, so
+    /// `load` reports the usual "does not exist"). Only file existence is
+    /// checked, never contents, so a corrupt project file still wins and
+    /// fails when loaded instead of falling through to the user's namespace.
+    pub fn resolve(&self, ns: &str, force_user: bool) -> Result<Resolved<'_>> {
+        if !force_user {
+            for project in &self.projects {
+                if project.exists(ns)? {
+                    return Ok(Resolved {
+                        cfg: project,
+                        shadows_user: self.user.exists(ns)?,
+                    });
+                }
+            }
+        }
+        Ok(Resolved {
+            cfg: &self.user,
+            shadows_user: false,
+        })
+    }
+
+    /// Where a new namespace goes: the nearest project level unless `force_user`.
+    pub fn creation_level(&self, force_user: bool) -> &Config {
+        match self.projects.first() {
+            Some(project) if !force_user => project,
+            _ => &self.user,
+        }
+    }
+
+    /// The `.envy/` level for `--project`: at the git repository root when
+    /// `cwd` is inside one (a `.git` directory or file), else at `cwd`.
+    /// Nothing is created on disk.
+    pub fn new_project_level(cwd: &Path, home: &Path, user: &Config) -> Config {
+        let cwd = canonical(cwd);
+        let root = cwd
+            .ancestors()
+            .find(|dir| fs::symlink_metadata(dir.join(".git")).is_ok())
+            .unwrap_or(&cwd)
+            .to_path_buf();
+        Config::project(
+            root.join(".envy"),
+            root.clone(),
+            identity_for_root(&root, home),
+            user.dir().to_path_buf(),
+        )
+    }
+
+    /// Every namespace of every project level (nearest first), then the user
+    /// level; names within a level are sorted.
+    pub fn entries(&self) -> Result<Vec<Entry>> {
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        for project in &self.projects {
+            for name in project.list()? {
+                let shadowed = !seen.insert(name.clone());
+                out.push(Entry {
+                    name,
+                    level: Level::Project {
+                        dir: project.dir().to_path_buf(),
+                    },
+                    shadowed,
+                });
+            }
+        }
+        for name in self.user.list()? {
+            let shadowed = !seen.insert(name.clone());
+            out.push(Entry {
+                name,
+                level: Level::User,
+                shadowed,
+            });
+        }
+        Ok(out)
+    }
+}
+
+fn canonical(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+    use tempfile::TempDir;
+
+    struct Fixture {
+        _tmp: TempDir,
+        home: PathBuf,
+        user_dir: PathBuf,
+    }
+
+    fn fixture() -> Fixture {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path().canonicalize().unwrap();
+        let home = base.join("home");
+        let user_dir = base.join("userconf");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&user_dir).unwrap();
+        Fixture {
+            _tmp: tmp,
+            home,
+            user_dir,
+        }
+    }
+
+    impl Fixture {
+        fn user(&self) -> Config {
+            Config::new(self.user_dir.clone())
+        }
+        fn mkdir(&self, rel: &str) -> PathBuf {
+            let p = self.home.join(rel);
+            fs::create_dir_all(&p).unwrap();
+            p
+        }
+        fn levels(&self, cwd: &Path) -> Levels {
+            Levels::discover(cwd, &self.home, self.user()).unwrap()
+        }
+    }
+
+    fn put(dir: &Path, name: &str, body: &str) {
+        fs::create_dir_all(dir).unwrap();
+        fs::write(dir.join(format!("{name}.toml")), body).unwrap();
+    }
+
+    fn dirs(l: &Levels) -> Vec<PathBuf> {
+        l.projects.iter().map(|c| c.dir().to_path_buf()).collect()
+    }
+
+    #[test]
+    fn discover_finds_nested_envy_dirs_nearest_first() {
+        let f = fixture();
+        let outer = f.mkdir("a");
+        let inner = f.mkdir("a/b/c");
+        fs::create_dir_all(outer.join(".envy")).unwrap();
+        fs::create_dir_all(f.home.join("a/b/.envy")).unwrap();
+        let l = f.levels(&inner);
+        assert_eq!(
+            dirs(&l),
+            vec![f.home.join("a/b/.envy"), outer.join(".envy")]
+        );
+        assert_eq!(l.projects[0].root(), Some(f.home.join("a/b").as_path()));
+        assert!(l.projects.iter().all(|c| c.user_dir() == f.user_dir));
+    }
+
+    #[test]
+    fn discovery_stops_before_home() {
+        let f = fixture();
+        fs::create_dir_all(f.home.join(".envy")).unwrap();
+        let cwd = f.mkdir("work/proj");
+        assert!(dirs(&f.levels(&cwd)).is_empty());
+        assert!(dirs(&f.levels(&f.home)).is_empty());
+    }
+
+    #[test]
+    fn cwd_outside_home_walks_to_the_root() {
+        let f = fixture();
+        let outside = f._tmp.path().canonicalize().unwrap().join("elsewhere/deep");
+        fs::create_dir_all(&outside).unwrap();
+        fs::create_dir_all(outside.parent().unwrap().join(".envy")).unwrap();
+        let l = f.levels(&outside);
+        assert_eq!(dirs(&l), vec![outside.parent().unwrap().join(".envy")]);
+    }
+
+    #[test]
+    fn an_envy_file_is_not_a_level() {
+        let f = fixture();
+        let cwd = f.mkdir("p");
+        fs::write(cwd.join(".envy"), "x").unwrap();
+        assert!(dirs(&f.levels(&cwd)).is_empty());
+    }
+
+    #[test]
+    fn a_symlinked_envy_is_ignored() {
+        let f = fixture();
+        let cwd = f.mkdir("p");
+        let target = f.mkdir("elsewhere");
+        put(&target, "dev", "A = \"1\"\n");
+        symlink(&target, cwd.join(".envy")).unwrap();
+        let l = f.levels(&cwd);
+        assert!(dirs(&l).is_empty());
+        assert!(!l.resolve("dev", false).unwrap().cfg.is_project());
+    }
+
+    #[test]
+    fn project_wins_and_reports_the_shadow() {
+        let f = fixture();
+        let cwd = f.mkdir("p");
+        put(&cwd.join(".envy"), "dev", "A = \"1\"\n");
+        put(&f.user_dir, "dev", "A = \"2\"\n");
+        let l = f.levels(&cwd);
+        let r = l.resolve("dev", false).unwrap();
+        assert!(r.cfg.is_project() && r.shadows_user);
+        let r = l.resolve("dev", true).unwrap();
+        assert!(!r.cfg.is_project() && !r.shadows_user);
+        assert_eq!(
+            shadow_note("dev"),
+            "note: project namespace \"dev\" shadows your user-level \"dev\"; use --user for yours"
+        );
+    }
+
+    #[test]
+    fn project_only_name_does_not_shadow() {
+        let f = fixture();
+        let cwd = f.mkdir("p");
+        put(&cwd.join(".envy"), "dev", "A = \"1\"\n");
+        let r = f.levels(&cwd).resolve("dev", false).unwrap().shadows_user;
+        assert!(!r);
+    }
+
+    #[test]
+    fn nearest_level_containing_the_name_wins() {
+        let f = fixture();
+        let cwd = f.mkdir("a/b");
+        put(&f.home.join("a/.envy"), "dev", "A = \"1\"\n");
+        put(&f.home.join("a/.envy"), "only_outer", "A = \"1\"\n");
+        put(&f.home.join("a/b/.envy"), "dev", "A = \"2\"\n");
+        let l = f.levels(&cwd);
+        let r = l.resolve("dev", false).unwrap();
+        assert_eq!(r.cfg.dir(), f.home.join("a/b/.envy"));
+        let r = l.resolve("only_outer", false).unwrap();
+        assert_eq!(r.cfg.dir(), f.home.join("a/.envy"));
+    }
+
+    #[test]
+    fn name_in_no_level_resolves_to_user() {
+        let f = fixture();
+        let cwd = f.mkdir("p");
+        fs::create_dir_all(cwd.join(".envy")).unwrap();
+        let l = f.levels(&cwd);
+        let r = l.resolve("nope", false).unwrap();
+        assert!(!r.cfg.is_project() && !r.shadows_user);
+        assert!(
+            r.cfg
+                .load("nope")
+                .unwrap_err()
+                .to_string()
+                .contains("does not exist")
+        );
+    }
+
+    #[test]
+    fn corrupt_project_file_fails_closed() {
+        let f = fixture();
+        let cwd = f.mkdir("p");
+        put(&cwd.join(".envy"), "dev", "this is [not toml");
+        put(&f.user_dir, "dev", "A = \"2\"\n");
+        let l = f.levels(&cwd);
+        let r = l.resolve("dev", false).unwrap();
+        assert!(r.cfg.is_project());
+        let err = format!("{:#}", r.cfg.load("dev").unwrap_err());
+        assert!(err.contains("dev"), "{err}");
+    }
+
+    #[test]
+    fn entries_mark_shadowed_names() {
+        let f = fixture();
+        let cwd = f.mkdir("a/b");
+        put(&f.home.join("a/b/.envy"), "dev", "A = \"1\"\n");
+        put(&f.home.join("a/.envy"), "dev", "A = \"1\"\n");
+        put(&f.home.join("a/.envy"), "ci", "A = \"1\"\n");
+        put(&f.user_dir, "dev", "A = \"1\"\n");
+        put(&f.user_dir, "mine", "A = \"1\"\n");
+        let e = f.levels(&cwd).entries().unwrap();
+        let got: Vec<_> = e.iter().map(|e| (e.name.as_str(), e.shadowed)).collect();
+        assert_eq!(
+            got,
+            vec![
+                ("dev", false),
+                ("ci", false),
+                ("dev", true),
+                ("dev", true),
+                ("mine", false)
+            ]
+        );
+        assert_eq!(
+            e[0].level,
+            Level::Project {
+                dir: f.home.join("a/b/.envy")
+            }
+        );
+        assert_eq!(e[4].level, Level::User);
+    }
+
+    #[test]
+    fn creation_level_defaults_to_nearest_envy_else_user() {
+        let f = fixture();
+        let plain = f.mkdir("plain");
+        assert!(!f.levels(&plain).creation_level(false).is_project());
+        let cwd = f.mkdir("p");
+        fs::create_dir_all(cwd.join(".envy")).unwrap();
+        let l = f.levels(&cwd);
+        assert_eq!(l.creation_level(false).dir(), cwd.join(".envy"));
+        assert!(!l.creation_level(true).is_project());
+    }
+
+    #[test]
+    fn new_project_level_uses_the_git_root_else_cwd() {
+        let f = fixture();
+        let repo = f.mkdir("repo");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        fs::write(
+            repo.join(".git/config"),
+            "[remote \"origin\"]\n\turl = git@github.com:acme/api.git\n",
+        )
+        .unwrap();
+        let sub = f.mkdir("repo/src/deep");
+        let user = f.user();
+        let c = Levels::new_project_level(&sub, &f.home, &user);
+        assert_eq!(c.dir(), repo.join(".envy"));
+        assert_eq!(c.root(), Some(repo.as_path()));
+        assert_eq!(c.identity(), Some("acme/api"));
+        assert!(!repo.join(".envy").exists());
+
+        let loose = f.mkdir("loose");
+        let c = Levels::new_project_level(&loose, &f.home, &user);
+        assert_eq!(c.dir(), loose.join(".envy"));
+        assert_eq!(c.identity(), Some("~/loose"));
+        assert_eq!(c.user_dir(), f.user_dir);
+        assert!(!loose.join(".envy").exists());
+
+        let worktree = f.mkdir("wt/x");
+        fs::write(f.home.join("wt/.git"), "gitdir: elsewhere\n").unwrap();
+        let c = Levels::new_project_level(&worktree, &f.home, &user);
+        assert_eq!(c.dir(), f.home.join("wt/.envy"));
+    }
+}

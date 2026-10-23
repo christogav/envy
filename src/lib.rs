@@ -4,6 +4,7 @@ pub mod commands;
 pub mod config;
 pub mod editor;
 pub mod init;
+pub mod levels;
 pub mod link;
 pub mod names;
 pub mod project;
