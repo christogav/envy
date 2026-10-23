@@ -46,13 +46,16 @@ pub fn identity_from_url(url: &str) -> Option<String> {
         }
         path
     };
-    let path = path.split(['?', '#']).next().unwrap_or("");
+    // Checked on the raw text, before any query/fragment is stripped: an `@`
+    // here is a credential that leaked past the authority (or a query that
+    // cannot be told apart from one), so the URL is refused.
     if path.contains('@') {
         return None;
     }
+    let path = path.split(['?', '#']).next().unwrap_or("");
     let mut segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
     let last = segments.pop()?;
-    segments.push(last.strip_suffix(".git").unwrap_or(last));
+    segments.push(last);
     let valid = |s: &&str| {
         !s.is_empty()
             && *s != "."
@@ -63,7 +66,12 @@ pub fn identity_from_url(url: &str) -> Option<String> {
     if segments.len() < 2 || !segments.iter().all(valid) {
         return None;
     }
-    Some(segments.join("/").to_lowercase())
+    let id = segments.join("/").to_lowercase();
+    // Lowercased first so `.GIT` and `.Git` are stripped too.
+    let id = id.strip_suffix(".git").unwrap_or(&id);
+    // The last segment must not have been only `.git`.
+    (id.rsplit('/').next().is_some_and(|l| !l.is_empty()) && id.contains('/'))
+        .then(|| id.to_string())
 }
 
 /// The identity of the project whose `.envy/` folder is in `root`: `org/project`
@@ -286,6 +294,43 @@ mod tests {
                 assert!(!id.contains("pw") && !id.contains("pa"), "{url}");
             }
         }
+    }
+
+    #[test]
+    fn an_at_sign_anywhere_after_the_authority_is_refused() {
+        for url in [
+            "https://user:pw/sec/ret?x@host/a/b",
+            "https://user:pa/ss/word#x@host/a/b",
+            "u:pa/ss/w?x@h:a/b",
+            "https://user:pw?x/y@host/a/b",
+            "https://host/a/b?token=x@y",
+            "git@host:a/b#frag@x",
+        ] {
+            assert_eq!(identity_from_url(url), None, "{url}");
+        }
+        assert_eq!(
+            identity_from_url("https://host/a/b?x=1#f"),
+            Some("a/b".to_string())
+        );
+        assert_eq!(
+            identity_from_url("ssh://git@host/a/b"),
+            Some("a/b".to_string())
+        );
+    }
+
+    #[test]
+    fn the_git_suffix_is_stripped_case_insensitively() {
+        for url in [
+            "https://host/A/B.GIT",
+            "https://host/a/b.Git",
+            "https://host/a/b.git",
+        ] {
+            assert_eq!(identity_from_url(url), Some("a/b".to_string()), "{url}");
+        }
+        assert_eq!(
+            identity_from_url("https://host/a/git"),
+            Some("a/git".to_string())
+        );
     }
 
     #[test]
