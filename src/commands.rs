@@ -538,9 +538,9 @@ pub fn remove(ctx: &Ctx, ns: &str) -> Result<()> {
     if !ctx.prompt.confirm(&question)? {
         bail!("cancelled; nothing was changed");
     }
-    let key = file.secret_key();
+    let key = ctx.cfg.secret_key(ns);
     for name in &secrets {
-        ctx.store.delete(key, name)?;
+        ctx.store.delete(&key, name)?;
     }
     ctx.cfg.delete(ns)
 }
@@ -2836,5 +2836,104 @@ mod tests {
             ]
         );
         assert!(!a.exists("dev").unwrap());
+    }
+
+    fn two_secret_change(cfg: &Config) -> Change {
+        let mut file = NamespaceFile::empty("dev").unwrap();
+        file.set_var("A", Value::Secret).unwrap();
+        file.set_var("B", Value::Secret).unwrap();
+        Change {
+            file,
+            before: cfg.load("dev").ok(),
+            secrets: vec![
+                ("A".into(), Secret::new("new-a".into())),
+                ("B".into(), Secret::new("new-b".into())),
+            ],
+            delete: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn project_keychain_failure_rolls_back_under_the_project_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = project_cfg(dir.path(), "acme/api");
+        let store = FailingSet {
+            inner: MemoryStore::default(),
+            fail_on: "B",
+        };
+        store
+            .inner
+            .set("dev", "A", &Secret::new("user-a".into()))
+            .unwrap();
+        store
+            .inner
+            .set("project/acme/api/dev", "A", &Secret::new("old-a".into()))
+            .unwrap();
+        let before = snap(&store.inner);
+        let prompt = ScriptedPrompter::new();
+        let ctx = Ctx {
+            cfg: &cfg,
+            store: &store,
+            prompt: &prompt,
+        };
+        // dev (A) is written first, then web (B) fails: dev must be rolled
+        // back by `rollback_all` under its project key.
+        let mut web = NamespaceFile::empty("web").unwrap();
+        web.set_var("B", Value::Secret).unwrap();
+        let web = Change {
+            file: web,
+            before: None,
+            secrets: vec![("B".into(), Secret::new("new-b".into()))],
+            delete: Vec::new(),
+        };
+        let mut dev = two_secret_change(&cfg);
+        dev.secrets.truncate(1);
+        assert!(apply(&ctx, vec![dev, web]).is_err());
+        assert_eq!(
+            before,
+            vec![
+                entry("dev", "A", "user-a"),
+                entry("project/acme/api/dev", "A", "old-a"),
+            ]
+        );
+        assert_eq!(snap(&store.inner), before);
+        assert!(!cfg.exists("dev").unwrap() && !cfg.exists("web").unwrap());
+    }
+
+    #[test]
+    fn project_file_save_failure_rolls_back_under_the_project_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = project_cfg(dir.path(), "acme/api");
+        let text = "[vars]\nA = \"@keychain\"\n";
+        std::fs::create_dir_all(cfg.dir()).unwrap();
+        std::fs::write(cfg.dir().join("dev.toml"), text).unwrap();
+        let store = SquatOnSet {
+            inner: MemoryStore::default(),
+            path: cfg.dir().join("dev.toml"),
+            kept: Default::default(),
+        };
+        store
+            .inner
+            .set("dev", "A", &Secret::new("user-a".into()))
+            .unwrap();
+        store
+            .inner
+            .set("project/acme/api/dev", "A", &Secret::new("old-a".into()))
+            .unwrap();
+        let before = snap(&store.inner);
+        let prompt = ScriptedPrompter::new();
+        let ctx = Ctx {
+            cfg: &cfg,
+            store: &store,
+            prompt: &prompt,
+        };
+        let err = apply(&ctx, vec![two_secret_change(&cfg)]).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("cannot write namespace \"dev\""),
+            "{err:#}"
+        );
+        assert!(cfg.dir().join("dev.toml").is_dir());
+        assert_eq!(store.kept.borrow().as_deref(), Some(text));
+        assert_eq!(snap(&store.inner), before);
     }
 }

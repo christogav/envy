@@ -410,6 +410,9 @@ impl Config {
         Self { dir, project: None }
     }
 
+    /// The caller must already have validated `identity` (`project::identity_for_root`
+    /// guarantees it); it is used verbatim in secret keys.
+    ///
     /// A project's `.envy` directory (`dir`) inside `root`, whose secrets are
     /// filed under `identity`. `user_dir` is the user's own config directory.
     pub fn project(dir: PathBuf, root: PathBuf, identity: String, user_dir: PathBuf) -> Self {
@@ -993,8 +996,15 @@ mod tests {
         let cfg = project_cfg(dir.path(), "acme/api");
         cfg.save(&NamespaceFile::empty("dev").unwrap()).unwrap();
         let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode(&cfg.dir().join("dev.toml")), 0o644);
-        assert_eq!(mode(cfg.dir()), 0o755);
+        // Project files honour the umask: owner keeps access, never wider
+        // than 0644 (files) or 0755 (directory).
+        let file = mode(&cfg.dir().join("dev.toml"));
+        assert_eq!(file & 0o600, 0o600, "{file:o}");
+        assert_eq!(file & !0o644, 0, "{file:o}");
+        let folder = mode(cfg.dir());
+        assert_eq!(folder & 0o700, 0o700, "{folder:o}");
+        assert_eq!(folder & !0o755, 0, "{folder:o}");
+        // User level uses explicit modes.
         let user = Config::new(dir.path().join("u"));
         user.save(&NamespaceFile::empty("dev").unwrap()).unwrap();
         assert_eq!(mode(&user.dir().join("dev.toml")), 0o600);

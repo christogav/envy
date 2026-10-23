@@ -41,6 +41,9 @@ fn unset_line(vars: &[String]) -> String {
 /// variables, record the new state (`ENVY_ACTIVE`, `ENVY_VARS`), then export
 /// the new variables. Every secret is fetched before any
 /// output is built, so a failure returns `Err` with nothing emitted.
+///
+/// `ns` must come from `Config::load`: a freshly parsed project file carries
+/// the default key and would read the user-level item with the same name.
 pub fn render_activate(
     ns: &NamespaceFile,
     prev: &ActiveState,

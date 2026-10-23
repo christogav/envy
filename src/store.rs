@@ -60,7 +60,8 @@ impl SecretStore for MemoryStore {
 }
 
 /// macOS login Keychain, accessed through the native Security framework.
-/// Items are generic passwords with service `envy.<namespace>` and account
+/// Items are generic passwords with service `envy.<key>` (e.g. `envy.project/acme/api/dev`; at user
+/// level the key is the namespace) and account
 /// `<name>`.
 #[cfg(target_os = "macos")]
 pub struct MacKeychain;
