@@ -61,7 +61,12 @@ fn run(action: Action) -> Result<String> {
             // Refuse before the config or the Keychain is read.
             check_emit()?;
             let cfg = Config::from_env()?;
-            commands::activate(&cfg, &MacKeychain, &ns, &active_state())
+            let ctx = Ctx {
+                cfg: &cfg,
+                store: &MacKeychain,
+                prompt: &TtyPrompter,
+            };
+            commands::activate(&ctx, &ns, &active_state())
         }
         Action::Off => {
             check_emit()?;

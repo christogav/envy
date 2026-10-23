@@ -15,19 +15,108 @@ use crate::names::{validate_namespace, validate_var};
 use crate::prompt::{Prompter, plain_label, secret_label, vet_plain};
 use crate::secret::Secret;
 use crate::store::SecretStore;
+use crate::trust::{TrustStore, confirmation_text};
 
-/// Shell text that switches to namespace `ns`. A linked namespace that has
-/// drifted from its group is refused. The result contains secrets by design:
-/// the caller may only write it to stdout.
-pub fn activate(
-    cfg: &Config,
-    store: &dyn SecretStore,
-    ns: &str,
-    prev: &ActiveState,
-) -> Result<String> {
-    let file = cfg.load(ns)?;
-    link::ensure_aligned(cfg, &file)?;
-    render_activate(&file, prev, store)
+/// Shell text that switches to namespace `ns`. The result contains secrets
+/// by design: the caller may only write it to stdout.
+///
+/// In order:
+/// 1. load `ns`, and refuse a linked namespace that drifted from its group;
+/// 2. at project level, unless this exact file at this checkout is already
+///    trusted, show the confirmation ([`check_trust`]);
+/// 3. ask, at a hidden prompt, for every secret the file lists that is not in
+///    the Keychain (at either level);
+/// 4. only then write: save the new secrets, record the trust, render.
+///
+/// A no, a failed prompt or no terminal leaves the Keychain, the trust
+/// records and stdout untouched.
+pub fn activate(ctx: &Ctx, ns: &str, prev: &ActiveState) -> Result<String> {
+    let file = ctx.cfg.load(ns)?;
+    link::ensure_aligned(ctx.cfg, &file)?;
+    let must_record = check_trust(ctx, &file)?;
+
+    let key = ctx.cfg.secret_key(ns);
+    let display_ns = match ctx.cfg.identity() {
+        Some(identity) => format!("{ns} (project {identity})"),
+        None => ns.to_string(),
+    };
+    let mut secrets: Vec<(String, Secret)> = Vec::new();
+    for (name, value) in file.vars() {
+        if value != Value::Secret || ctx.store.get(&key, &name)?.is_some() {
+            continue;
+        }
+        let secret = ctx
+            .prompt
+            .secret(&secret_label(&name, &display_ns))
+            .with_context(|| {
+                format!(
+                    "secret {name} of namespace {ns} is not in the Keychain and was not entered \
+                     (run envy {ns} in a terminal to enter it); nothing was changed"
+                )
+            })?;
+        secrets.push((name, secret));
+    }
+
+    // Every prompt has returned: write.
+    let undo = write_secrets(ctx, &key, &secrets)?;
+    if must_record && let Err(e) = record_trust(ctx, &file) {
+        return Err(rollback(ctx, &key, undo, e));
+    }
+    // `render_activate` fetches every secret before building any output, so
+    // a failure here prints nothing. The secrets just saved stay saved: the
+    // user entered them for this namespace and confirmed it.
+    render_activate(&file, prev, ctx.store)
+}
+
+/// Asks before a project namespace is used, unless this exact file at this
+/// checkout is already trusted. Returns `Ok(true)` when the user said yes and
+/// the caller must [`record_trust`] once its own writes have succeeded;
+/// `Ok(false)` when there is nothing to record (user level, or already
+/// trusted). A no, or no terminal to ask on, is an `Err`. The question names
+/// variables and which secrets are already in the Keychain, never a value.
+pub(crate) fn check_trust(ctx: &Ctx, file: &NamespaceFile) -> Result<bool> {
+    let Some(root) = ctx.cfg.root() else {
+        // The user's own namespace: never asked about.
+        return Ok(false);
+    };
+    let ns = file.name();
+    let trust = TrustStore::new(ctx.cfg.user_dir());
+    let text = file.text();
+    if trust.is_trusted(root, ns, &text)? {
+        return Ok(false);
+    }
+    let key = ctx.cfg.secret_key(ns);
+    let mut in_keychain: Vec<String> = Vec::new();
+    for (name, value) in file.vars() {
+        // Existence only: the value is dropped unread.
+        if value == Value::Secret && ctx.store.get(&key, &name)?.is_some() {
+            in_keychain.push(name);
+        }
+    }
+    let mut question = String::new();
+    if trust.previously_trusted(root, ns)? {
+        question.push_str("Note: this namespace file has changed since you last trusted it.\n\n");
+    }
+    question.push_str(&confirmation_text(ctx.cfg, file, &in_keychain));
+    let yes = ctx.prompt.confirm(&question).with_context(|| {
+        format!(
+            "project namespace {ns:?} is not trusted yet and needs a terminal to review it \
+             (run envy {ns} in a terminal); nothing was changed"
+        )
+    })?;
+    if !yes {
+        bail!("not loaded: you did not trust namespace {ns:?}; nothing was changed");
+    }
+    Ok(true)
+}
+
+/// Records that the user trusts `file` as it is now, at this checkout. Does
+/// nothing at user level.
+pub(crate) fn record_trust(ctx: &Ctx, file: &NamespaceFile) -> Result<()> {
+    match ctx.cfg.root() {
+        Some(root) => TrustStore::new(ctx.cfg.user_dir()).record(root, file.name(), &file.text()),
+        None => Ok(()),
+    }
 }
 
 /// Lists namespace names, one per line, `* ` marking the active one. Names
@@ -917,7 +1006,13 @@ mod tests {
         let (_dir, cfg) = config_with(&[("work", "[vars]\nA = \"x\"\nB = \"@keychain\"\n")]);
         let store = MemoryStore::default();
         store.set("work", "B", &Secret::new("s".into())).unwrap();
-        let out = activate(&cfg, &store, "work", &ActiveState::default()).unwrap();
+        let prompt = ScriptedPrompter::new();
+        let out = activate(
+            &ctx_for(&cfg, &store, &prompt),
+            "work",
+            &ActiveState::default(),
+        )
+        .unwrap();
         assert_eq!(
             out,
             "export ENVY_ACTIVE='work'\nexport ENVY_VARS='A B'\nexport A='x'\nexport B='s'\n"
@@ -927,9 +1022,10 @@ mod tests {
     #[test]
     fn activate_unknown_namespace_names_it_and_mentions_new() {
         let (_dir, cfg) = config_with(&[]);
+        let store = MemoryStore::default();
+        let prompt = ScriptedPrompter::new();
         let err = activate(
-            &cfg,
-            &MemoryStore::default(),
+            &ctx_for(&cfg, &store, &prompt),
             "nope",
             &ActiveState::default(),
         )
@@ -2821,7 +2917,21 @@ mod tests {
                 entry("project/acme/web/dev", "TOKEN", "vb"),
             ]
         );
-        let render = |cfg: &Config| activate(cfg, &store, "dev", &ActiveState::default()).unwrap();
+        // Project namespaces are confirmed on first load; the user's is not.
+        let render = |cfg: &Config| {
+            let answers = if cfg.is_project() {
+                ScriptedPrompter::new().with_confirm(true)
+            } else {
+                ScriptedPrompter::new()
+            };
+            let out = activate(
+                &ctx_for(cfg, &store, &answers),
+                "dev",
+                &ActiveState::default(),
+            );
+            assert_eq!(answers.remaining(), 0);
+            out.unwrap()
+        };
         assert!(render(&a).ends_with("export TOKEN='va'\n"));
         assert!(render(&b).ends_with("export TOKEN='vb'\n"));
         assert!(render(&user).ends_with("export TOKEN='vu'\n"));
@@ -2944,5 +3054,509 @@ mod tests {
         assert!(cfg.dir().join("dev.toml").is_dir());
         assert_eq!(store.kept.borrow().as_deref(), Some(text));
         assert_eq!(snap(&store.inner), before);
+    }
+
+    // ---- activate: trust and missing secrets ----
+
+    const PROJ: &str = "[vars]\nREGION = \"eu\"\nTOKEN = \"@keychain\"\nAPI_KEY = \"@keychain\"\n";
+    const PKEY: &str = "project/acme/api/dev";
+    const CHANGED_NOTE: &str =
+        "Note: this namespace file has changed since you last trusted it.\n\n";
+
+    /// A project checkout at `base/<checkout>` holding `.envy/dev.toml`, whose
+    /// trust records live in the shared `base/user`.
+    fn checkout(base: &Path, checkout: &str, text: &str) -> Config {
+        let root = base.join(checkout);
+        std::fs::create_dir_all(root.join(".envy")).unwrap();
+        std::fs::write(root.join(".envy/dev.toml"), text).unwrap();
+        Config::project(
+            root.join(".envy"),
+            root,
+            "acme/api".into(),
+            base.join("user"),
+        )
+    }
+
+    fn trusted(cfg: &Config, text: &str) -> bool {
+        crate::trust::TrustStore::new(cfg.user_dir())
+            .is_trusted(cfg.root().unwrap(), "dev", text)
+            .unwrap()
+    }
+
+    fn project_label(name: &str) -> String {
+        secret_label(name, "dev (project acme/api)")
+    }
+
+    /// A prompter on a machine with no terminal: every prompt fails.
+    struct NoTerminal;
+
+    impl Prompter for NoTerminal {
+        fn secret(&self, _: &str) -> Result<Secret> {
+            bail!("no terminal available to prompt on (cannot open /dev/tty)")
+        }
+        fn plain(&self, _: &str, _: Option<&str>) -> Result<String> {
+            bail!("no terminal available to prompt on (cannot open /dev/tty)")
+        }
+        fn confirm(&self, _: &str) -> Result<bool> {
+            bail!("no terminal available to prompt on (cannot open /dev/tty)")
+        }
+    }
+
+    #[test]
+    fn untrusted_project_namespace_is_confirmed_then_loaded() {
+        let base = tempfile::tempdir().unwrap();
+        let cfg = checkout(base.path(), "a", PROJ);
+        let store = MemoryStore::default();
+        let prompt = ScriptedPrompter::new()
+            .with_confirm(true)
+            .with_secret("tok-1")
+            .with_secret("key-1");
+        let out = activate(
+            &ctx_for(&cfg, &store, &prompt),
+            "dev",
+            &ActiveState::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            "export ENVY_ACTIVE='dev'\nexport ENVY_VARS='REGION TOKEN API_KEY'\n\
+             export REGION='eu'\nexport TOKEN='tok-1'\nexport API_KEY='key-1'\n"
+        );
+        assert_eq!(
+            snap(&store),
+            vec![
+                entry(PKEY, "API_KEY", "key-1"),
+                entry(PKEY, "TOKEN", "tok-1")
+            ]
+        );
+        assert!(trusted(&cfg, PROJ));
+        let asked = prompt.asked();
+        assert_eq!(asked.len(), 3);
+        assert!(matches!(&asked[0], Asked::Confirm(text) if text.contains("acme/api")));
+        // Labels name the variable, the namespace and the project.
+        assert_eq!(
+            asked[1..],
+            [
+                Asked::Secret(project_label("TOKEN")),
+                Asked::Secret(project_label("API_KEY")),
+            ]
+        );
+        // Trusted and complete: the second load asks nothing.
+        let quiet = ScriptedPrompter::new();
+        let again = activate(
+            &ctx_for(&cfg, &store, &quiet),
+            "dev",
+            &ActiveState::default(),
+        )
+        .unwrap();
+        assert_eq!(again, out);
+        assert!(quiet.asked().is_empty());
+    }
+
+    #[test]
+    fn confirmation_comes_before_any_secret_prompt() {
+        let base = tempfile::tempdir().unwrap();
+        let cfg = checkout(base.path(), "a", PROJ);
+        let store = MemoryStore::default();
+        let prompt = ScriptedPrompter::new()
+            .with_confirm(true)
+            .with_secret("tok-1")
+            .with_secret("key-1");
+        activate(
+            &ctx_for(&cfg, &store, &prompt),
+            "dev",
+            &ActiveState::default(),
+        )
+        .unwrap();
+        let kinds: Vec<&str> = prompt
+            .asked()
+            .iter()
+            .map(|a| match a {
+                Asked::Confirm(_) => "confirm",
+                Asked::Secret(_) => "secret",
+                Asked::Plain { .. } => "plain",
+            })
+            .collect();
+        assert_eq!(kinds, ["confirm", "secret", "secret"]);
+        // The confirmation lists which secrets will be asked for.
+        let Asked::Confirm(text) = &prompt.asked()[0] else {
+            unreachable!()
+        };
+        assert!(
+            text.contains("secret TOKEN: you will be asked for it")
+                && text.contains("secret API_KEY: you will be asked for it"),
+            "{text}"
+        );
+        assert!(!text.starts_with("Note:"), "{text}");
+    }
+
+    #[test]
+    fn declining_the_confirmation_changes_nothing() {
+        let base = tempfile::tempdir().unwrap();
+        let cfg = checkout(base.path(), "a", PROJ);
+        let store = MemoryStore::default();
+        let prompt = ScriptedPrompter::new()
+            .with_confirm(false)
+            .with_secret("tok-1")
+            .with_secret("key-1");
+        let err = activate(
+            &ctx_for(&cfg, &store, &prompt),
+            "dev",
+            &ActiveState::default(),
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("nothing was changed"), "{msg}");
+        assert!(snap(&store).is_empty());
+        assert!(!trusted(&cfg, PROJ));
+        assert!(!base.path().join("user/trust").exists());
+    }
+
+    #[test]
+    fn declined_confirmation_prompts_for_no_secret() {
+        let base = tempfile::tempdir().unwrap();
+        let cfg = checkout(base.path(), "a", PROJ);
+        let store = MemoryStore::default();
+        let prompt = ScriptedPrompter::new()
+            .with_confirm(false)
+            .with_secret("tok-1")
+            .with_secret("key-1");
+        assert!(
+            activate(
+                &ctx_for(&cfg, &store, &prompt),
+                "dev",
+                &ActiveState::default()
+            )
+            .is_err()
+        );
+        assert_eq!(prompt.asked().len(), 1);
+        assert!(matches!(prompt.asked()[0], Asked::Confirm(_)));
+        assert_eq!(prompt.remaining(), 2);
+    }
+
+    #[test]
+    fn a_cancelled_secret_prompt_records_nothing() {
+        let base = tempfile::tempdir().unwrap();
+        let cfg = checkout(base.path(), "a", PROJ);
+        let store = MemoryStore::default();
+        // Yes, one secret, then the prompter runs out on the second.
+        let prompt = ScriptedPrompter::new()
+            .with_confirm(true)
+            .with_secret("tok-1");
+        let err = activate(
+            &ctx_for(&cfg, &store, &prompt),
+            "dev",
+            &ActiveState::default(),
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("API_KEY") && msg.contains("nothing was changed"),
+            "{msg}"
+        );
+        assert!(!msg.contains("tok-1"), "{msg}");
+        assert!(snap(&store).is_empty());
+        assert!(!trusted(&cfg, PROJ));
+    }
+
+    #[test]
+    fn keychain_write_failure_records_no_trust() {
+        let base = tempfile::tempdir().unwrap();
+        let cfg = checkout(base.path(), "a", PROJ);
+        let store = FailingSet {
+            inner: MemoryStore::default(),
+            fail_on: "API_KEY",
+        };
+        let prompt = ScriptedPrompter::new()
+            .with_confirm(true)
+            .with_secret("tok-1")
+            .with_secret("key-1");
+        assert!(
+            activate(
+                &ctx_for(&cfg, &store, &prompt),
+                "dev",
+                &ActiveState::default()
+            )
+            .is_err()
+        );
+        assert!(snap(&store.inner).is_empty());
+        assert!(!trusted(&cfg, PROJ));
+    }
+
+    #[test]
+    fn trust_record_failure_rolls_back_the_new_secrets() {
+        let base = tempfile::tempdir().unwrap();
+        let cfg = checkout(base.path(), "a", PROJ);
+        // A regular file where the trust directory goes: recording fails.
+        std::fs::create_dir_all(base.path().join("user")).unwrap();
+        std::fs::write(base.path().join("user/trust"), "").unwrap();
+        let store = MemoryStore::default();
+        store
+            .set(PKEY, "TOKEN", &Secret::new("old-tok".into()))
+            .unwrap();
+        let prompt = ScriptedPrompter::new()
+            .with_confirm(true)
+            .with_secret("key-1");
+        let err = activate(
+            &ctx_for(&cfg, &store, &prompt),
+            "dev",
+            &ActiveState::default(),
+        )
+        .unwrap_err();
+        assert!(!format!("{err:#}").contains("old-tok"), "{err:#}");
+        assert_eq!(snap(&store), vec![entry(PKEY, "TOKEN", "old-tok")]);
+    }
+
+    #[test]
+    fn changed_file_says_so() {
+        let base = tempfile::tempdir().unwrap();
+        let cfg = checkout(base.path(), "a", PROJ);
+        crate::trust::TrustStore::new(cfg.user_dir())
+            .record(cfg.root().unwrap(), "dev", PROJ)
+            .unwrap();
+        let changed = format!("{PROJ}EVIL = \"1\"\n");
+        std::fs::write(cfg.dir().join("dev.toml"), &changed).unwrap();
+        let store = MemoryStore::default();
+        let prompt = ScriptedPrompter::new().with_confirm(false);
+        assert!(
+            activate(
+                &ctx_for(&cfg, &store, &prompt),
+                "dev",
+                &ActiveState::default()
+            )
+            .is_err()
+        );
+        let Asked::Confirm(text) = &prompt.asked()[0] else {
+            panic!("{:?}", prompt.asked())
+        };
+        assert!(text.starts_with(CHANGED_NOTE), "{text}");
+        assert!(text.contains("EVIL"), "{text}");
+        // The old record still stands; the changed text is not trusted.
+        assert!(trusted(&cfg, PROJ) && !trusted(&cfg, &changed));
+    }
+
+    #[test]
+    fn trusted_namespace_prompts_only_for_missing_secrets() {
+        let base = tempfile::tempdir().unwrap();
+        let cfg = checkout(base.path(), "a", PROJ);
+        crate::trust::TrustStore::new(cfg.user_dir())
+            .record(cfg.root().unwrap(), "dev", PROJ)
+            .unwrap();
+        let store = MemoryStore::default();
+        store
+            .set(PKEY, "TOKEN", &Secret::new("tok-0".into()))
+            .unwrap();
+        let prompt = ScriptedPrompter::new().with_secret("key-1");
+        let out = activate(
+            &ctx_for(&cfg, &store, &prompt),
+            "dev",
+            &ActiveState::default(),
+        )
+        .unwrap();
+        assert!(
+            out.ends_with("export TOKEN='tok-0'\nexport API_KEY='key-1'\n"),
+            "{out}"
+        );
+        assert_eq!(
+            prompt.asked(),
+            vec![Asked::Secret(project_label("API_KEY"))]
+        );
+        assert!(trusted(&cfg, PROJ));
+    }
+
+    #[test]
+    fn trust_is_bound_to_the_checkout_path() {
+        let base = tempfile::tempdir().unwrap();
+        let a = checkout(base.path(), "a", PROJ);
+        let b = checkout(base.path(), "b", PROJ);
+        let store = MemoryStore::default();
+        let first = ScriptedPrompter::new()
+            .with_confirm(true)
+            .with_secret("tok-1")
+            .with_secret("key-1");
+        activate(&ctx_for(&a, &store, &first), "dev", &ActiveState::default()).unwrap();
+        assert!(trusted(&a, PROJ) && !trusted(&b, PROJ));
+        // Same text, same identity, other checkout: asked again; a no leaves
+        // checkout b untrusted and the shared secrets alone.
+        let declined = ScriptedPrompter::new().with_confirm(false);
+        assert!(
+            activate(
+                &ctx_for(&b, &store, &declined),
+                "dev",
+                &ActiveState::default()
+            )
+            .is_err()
+        );
+        assert!(matches!(declined.asked()[..], [Asked::Confirm(_)]));
+        assert!(!trusted(&b, PROJ));
+        assert_eq!(snap(&store).len(), 2);
+    }
+
+    #[test]
+    fn second_checkout_asks_again_but_shared_secrets_are_not_reasked() {
+        let base = tempfile::tempdir().unwrap();
+        let a = checkout(base.path(), "a", PROJ);
+        let b = checkout(base.path(), "b", PROJ);
+        let store = MemoryStore::default();
+        let first = ScriptedPrompter::new()
+            .with_confirm(true)
+            .with_secret("tok-1")
+            .with_secret("key-1");
+        let out_a = activate(&ctx_for(&a, &store, &first), "dev", &ActiveState::default()).unwrap();
+        let second = ScriptedPrompter::new().with_confirm(true);
+        let out_b = activate(
+            &ctx_for(&b, &store, &second),
+            "dev",
+            &ActiveState::default(),
+        )
+        .unwrap();
+        assert_eq!(out_a, out_b);
+        let asked = second.asked();
+        assert_eq!(asked.len(), 1, "{asked:?}");
+        let Asked::Confirm(text) = &asked[0] else {
+            panic!("{asked:?}")
+        };
+        assert!(
+            text.contains("secret TOKEN: already in your Keychain")
+                && text.contains("secret API_KEY: already in your Keychain"),
+            "{text}"
+        );
+        assert!(!text.starts_with("Note:"), "{text}");
+        assert!(trusted(&b, PROJ));
+    }
+
+    #[test]
+    fn drifted_group_is_refused_before_any_prompt() {
+        let base = tempfile::tempdir().unwrap();
+        let cfg = checkout(
+            base.path(),
+            "a",
+            "link = \"aws\"\n\n[vars]\nTOKEN = \"@keychain\"\n",
+        );
+        std::fs::write(
+            cfg.dir().join("other.toml"),
+            "link = \"aws\"\n\n[vars]\nREGION = \"us\"\n",
+        )
+        .unwrap();
+        let store = MemoryStore::default();
+        let prompt = ScriptedPrompter::new()
+            .with_confirm(true)
+            .with_secret("tok-1");
+        let err = activate(
+            &ctx_for(&cfg, &store, &prompt),
+            "dev",
+            &ActiveState::default(),
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("missing REGION"), "{err:#}");
+        assert!(prompt.asked().is_empty());
+        assert!(snap(&store).is_empty());
+        assert!(!base.path().join("user/trust").exists());
+    }
+
+    #[test]
+    fn confirmation_contains_no_secret_value() {
+        let base = tempfile::tempdir().unwrap();
+        let cfg = checkout(base.path(), "a", PROJ);
+        let store = MemoryStore::default();
+        store
+            .set(PKEY, "TOKEN", &Secret::new("zq-stored-secret".into()))
+            .unwrap();
+        // Declined, then accepted with the secret prompt failing.
+        let declined = ScriptedPrompter::new().with_confirm(false);
+        let err1 = activate(
+            &ctx_for(&cfg, &store, &declined),
+            "dev",
+            &ActiveState::default(),
+        )
+        .unwrap_err();
+        let failed = ScriptedPrompter::new().with_confirm(true);
+        let err2 = activate(
+            &ctx_for(&cfg, &store, &failed),
+            "dev",
+            &ActiveState::default(),
+        )
+        .unwrap_err();
+        let seen = format!(
+            "{:?} {:?} {err1:#} {err1:?} {err2:#} {err2:?}",
+            declined.asked(),
+            failed.asked()
+        );
+        assert!(
+            seen.contains("secret TOKEN: already in your Keychain"),
+            "{seen}"
+        );
+        assert!(!seen.contains("zq-stored-secret"), "{seen}");
+        assert_eq!(snap(&store), vec![entry(PKEY, "TOKEN", "zq-stored-secret")]);
+    }
+
+    #[test]
+    fn user_level_missing_secret_is_prompted() {
+        let (_dir, cfg) = config_with(&[("work", "[vars]\nA = \"x\"\nB = \"@keychain\"\n")]);
+        let store = MemoryStore::default();
+        let prompt = ScriptedPrompter::new().with_secret("b-1");
+        let out = activate(
+            &ctx_for(&cfg, &store, &prompt),
+            "work",
+            &ActiveState::default(),
+        )
+        .unwrap();
+        assert!(out.ends_with("export A='x'\nexport B='b-1'\n"), "{out}");
+        assert_eq!(
+            prompt.asked(),
+            vec![Asked::Secret(secret_label("B", "work"))]
+        );
+        assert_eq!(snap(&store), vec![entry("work", "B", "b-1")]);
+    }
+
+    #[test]
+    fn user_level_never_confirms() {
+        let (dir, cfg) = config_with(&[("work", "[vars]\nA = \"x\"\nB = \"@keychain\"\n")]);
+        let store = MemoryStore::default();
+        store.set("work", "B", &Secret::new("b-0".into())).unwrap();
+        let prompt = ScriptedPrompter::new();
+        activate(
+            &ctx_for(&cfg, &store, &prompt),
+            "work",
+            &ActiveState::default(),
+        )
+        .unwrap();
+        assert!(prompt.asked().is_empty());
+        assert!(!dir.path().join("trust").exists());
+    }
+
+    #[test]
+    fn no_terminal_is_an_error() {
+        // An untrusted project namespace.
+        let base = tempfile::tempdir().unwrap();
+        let cfg = checkout(base.path(), "a", PROJ);
+        let store = MemoryStore::default();
+        let err = activate(
+            &ctx_for(&cfg, &store, &NoTerminal),
+            "dev",
+            &ActiveState::default(),
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("needs a terminal") && msg.contains("nothing was changed"),
+            "{msg}"
+        );
+        assert!(snap(&store).is_empty());
+        assert!(!trusted(&cfg, PROJ));
+        // A missing secret at user level.
+        let (_dir, user) = config_with(&[("work", "[vars]\nB = \"@keychain\"\n")]);
+        let err = activate(
+            &ctx_for(&user, &store, &NoTerminal),
+            "work",
+            &ActiveState::default(),
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("B") && msg.contains("terminal") && msg.contains("nothing was changed"),
+            "{msg}"
+        );
+        assert!(snap(&store).is_empty());
     }
 }

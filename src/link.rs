@@ -1519,16 +1519,24 @@ mod tests {
         let b = "link = \"aws\"\n\n[vars]\nREGION = \"us\"\n";
         let (_dir, cfg) = config_with(&[("a", SECRET_A), ("b", b)]);
         let store = store_with(&[("a", "TOKEN", "zq-secret")]);
-        let err = activate(&cfg, &store, "b", &ActiveState::default())
-            .unwrap_err()
-            .to_string();
+        let err = activate(
+            &ctx(&cfg, &store, &ScriptedPrompter::new()),
+            "b",
+            &ActiveState::default(),
+        )
+        .unwrap_err()
+        .to_string();
         assert!(
             err.contains("missing TOKEN") && err.contains("--link"),
             "{err}"
         );
-        let err = activate(&cfg, &store, "a", &ActiveState::default())
-            .unwrap_err()
-            .to_string();
+        let err = activate(
+            &ctx(&cfg, &store, &ScriptedPrompter::new()),
+            "a",
+            &ActiveState::default(),
+        )
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("extra TOKEN"), "{err}");
         assert!(!err.contains("zq-secret"), "{err}");
     }
@@ -1537,7 +1545,12 @@ mod tests {
     fn aligned_linked_namespace_activates() {
         let (_dir, cfg) = config_with(&[("a", SECRET_A), ("b", SECRET_B)]);
         let store = store_with(&[("a", "TOKEN", "ta"), ("b", "TOKEN", "tb")]);
-        let out = activate(&cfg, &store, "b", &ActiveState::default()).unwrap();
+        let out = activate(
+            &ctx(&cfg, &store, &ScriptedPrompter::new()),
+            "b",
+            &ActiveState::default(),
+        )
+        .unwrap();
         assert!(out.contains("export TOKEN='tb'\n"), "{out}");
     }
 
@@ -1553,7 +1566,12 @@ mod tests {
         assert_eq!(read(&dir, "u"), format!("{u}NEW = \"@keychain\"\n"));
         assert_eq!(read(&dir, "a"), SECRET_A);
         assert_eq!(read(&dir, "b"), SECRET_B);
-        let out = activate(&cfg, &store, "u", &ActiveState::default()).unwrap();
+        let out = activate(
+            &ctx(&cfg, &store, &ScriptedPrompter::new()),
+            "u",
+            &ActiveState::default(),
+        )
+        .unwrap();
         assert!(out.contains("export NEW='s'\n"), "{out}");
         // Propagating from an unlinked namespace does nothing at all.
         let quiet = ScriptedPrompter::new();
