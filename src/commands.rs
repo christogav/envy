@@ -76,19 +76,28 @@ pub fn list_vars(cfg: &Config, ns: &str, active: &ActiveState) -> Result<String>
         out.push_str("(no variables)\n");
         return Ok(out);
     }
+    out.push_str(&render_var_rows(&vars));
+    Ok(out)
+}
+
+/// One `NAME  value` row per variable, names padded to the longest, plain
+/// values quoted and escaped, secrets as the bare marker. Shared by `--list`
+/// and the first-load confirmation so both show a variable the same way.
+pub(crate) fn render_var_rows(vars: &[(String, Value)]) -> String {
     let width = vars
         .iter()
         .map(|(n, _)| n.chars().count())
         .max()
         .unwrap_or(0);
-    for (name, value) in &vars {
+    let mut out = String::new();
+    for (name, value) in vars {
         let shown = match value {
             Value::Secret => SECRET_MARKER.to_string(),
             Value::Plain(v) => quote_for_display(v),
         };
         out.push_str(&format!("{name:<width$}  {shown}\n"));
     }
-    Ok(out)
+    out
 }
 
 /// `value` in double quotes with everything that could move the cursor,
@@ -125,7 +134,7 @@ fn is_invisible_or_control(c: char) -> bool {
             | 0xe0000..=0xe0fff)
 }
 
-fn quote_for_display(value: &str) -> String {
+pub(crate) fn quote_for_display(value: &str) -> String {
     let mut out = String::from("\"");
     for c in value.chars() {
         match c {

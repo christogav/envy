@@ -12,3 +12,4 @@ pub mod prompt;
 pub mod quote;
 pub mod secret;
 pub mod store;
+pub mod trust;
