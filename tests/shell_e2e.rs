@@ -775,3 +775,71 @@ fn list_of_an_unknown_namespace_fails_with_the_hint_on_stderr() {
     let err = stderr(&out);
     assert!(err.contains("bogus") && err.contains("--new"), "{err}");
 }
+
+/// Runs each argv through the real shell function with a STUB `envy` on the
+/// `PATH` that prints `print -r -- EVALUATED`. If the function evaluates the
+/// output, the line is `EVALUATED`; if it only runs the stub, the line is the
+/// literal `print -r -- EVALUATED`.
+fn wrapper_outcomes(argvs: &[&[&str]]) -> Vec<String> {
+    let stub_dir = tempfile::tempdir().unwrap();
+    let stub = stub_dir.path().join("envy");
+    std::fs::write(&stub, "#!/bin/sh\necho 'print -r -- EVALUATED'\n").unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    // The function text comes from the real binary, run before the stub.
+    let function = String::from_utf8(
+        Command::new(ENVY)
+            .args(["--init", "zsh"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    let mut script = function;
+    for args in argvs {
+        let quoted: Vec<String> = args.iter().map(|a| format!("'{a}'")).collect();
+        script.push_str(&format!("envy {}\n", quoted.join(" ")));
+    }
+    let out = Command::new("zsh")
+        .args(["-f", "-c", &script])
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                stub_dir.path().display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .env_remove("ENVY_EVAL")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", stderr(&out));
+    stdout(&out).lines().map(str::to_string).collect()
+}
+
+#[test]
+fn user_flag_forms_are_evaluated_and_other_shapes_are_not() {
+    let evaluated: &[&[&str]] = &[&["dev", "--user"], &["--user", "dev"], &["dev"], &["--off"]];
+    let shown: &[&[&str]] = &[
+        &["dev", "--user", "--list"],
+        &["--list", "--user"],
+        &["dev", "--list"],
+        &["--user", "--off"],
+        &["dev", "--secret", "A"],
+        &["--init", "zsh"],
+        &["--user"],
+        &["dev", "--new", "--project"],
+    ];
+    let all: Vec<&[&str]> = evaluated.iter().chain(shown).copied().collect();
+    let lines = wrapper_outcomes(&all);
+    assert_eq!(lines.len(), all.len(), "{lines:?}");
+    for (args, line) in all.iter().zip(&lines) {
+        let want = evaluated.contains(args);
+        assert_eq!(line == "EVALUATED", want, "{args:?}: {line}");
+        if !want {
+            assert_eq!(line, "print -r -- EVALUATED", "{args:?}");
+        }
+    }
+}

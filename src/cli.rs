@@ -35,6 +35,22 @@ pub enum Action {
     List(String),
 }
 
+/// Which levels a name may resolve at: `--user` forces the user's own,
+/// `--project` (with `--new`) creates in the project, otherwise `Auto`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scope {
+    Auto,
+    User,
+    Project,
+}
+
+/// A parsed command line: what to do, and at which level.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Command {
+    pub action: Action,
+    pub scope: Scope,
+}
+
 /// Shown after the options in `--help`: what envy does, and the setup line.
 const AFTER_HELP: &str = "\
 envy keeps sets of environment variables, called namespaces, and loads one
@@ -44,6 +60,11 @@ values and the names live in ~/.config/envy/<namespace>.toml (or in
 $ENVY_CONFIG_DIR). Run `envy --list` (or `envy` alone) to list the namespaces,
 and `envy <namespace> --list` (alias `--ls`) to show a namespace's variables:
 plain values are shown, secret values never are.
+
+A namespace can also live in a project's .envy/ folder. A name resolves to the
+project's namespace first, then your own; `envy <namespace> --user` uses your
+own even when the project has one with that name, and `--project` (with
+`--new`) creates the namespace in the project's .envy/ folder.
 
 Example: set two secrets and two plain variables in one go (the secrets are
 prompted for, hidden; AWS_REGION is given; AWS_PROFILE is prompted for):
@@ -110,12 +131,20 @@ struct Flags {
     /// Remove the namespace
     #[arg(long)]
     rm: bool,
+
+    /// Use your own namespace even when the project has one with the same name
+    #[arg(long)]
+    user: bool,
+
+    /// With --new: create the namespace in this project's .envy/ folder
+    #[arg(long)]
+    project: bool,
 }
 
 /// Parses command-line arguments (first item is the program name) into an
-/// [`Action`]. Pure: never exits or prints. clap's own failures, including
+/// [`Command`]. Pure: never exits or prints. clap's own failures, including
 /// `--help`, come back as `Err` carrying clap's rendered text.
-pub fn parse<I, T>(args: I) -> Result<Action>
+pub fn parse<I, T>(args: I) -> Result<Command>
 where
     I: IntoIterator<Item = T>,
     T: Into<OsString> + Clone,
@@ -129,10 +158,19 @@ where
     parse_unredacted(args).map_err(|e| redact_error(e, &typed))
 }
 
-fn parse_unredacted(args: Vec<OsString>) -> Result<Action> {
-    let matches = Flags::command().try_get_matches_from(args)?;
+fn parse_unredacted(args: Vec<OsString>) -> Result<Command> {
+    let matches = Flags::command().try_get_matches_from(&args)?;
     let items = typed_items(&matches);
-    Flags::from_arg_matches(&matches)?.into_action(items)
+    let command = Flags::from_arg_matches(&matches)?.into_action(items)?;
+    // The shell function evaluates by the shape of the arguments, and a `--`
+    // is a flag-like word to it: refuse the one spelling that would activate
+    // through it, so the function and the parser never disagree.
+    if matches!(command.action, Action::Activate(_) | Action::Off)
+        && args.iter().skip(1).any(|a| a == "--")
+    {
+        bail!("a bare `--` is not supported when loading a namespace: envy <namespace>");
+    }
+    Ok(command)
 }
 
 /// Removes from a parse error whatever the user typed after a `=` (see
@@ -252,7 +290,7 @@ fn to_item(secret: bool, raw: &str) -> Result<SetItem> {
 }
 
 impl Flags {
-    fn into_action(self, typed: Vec<(bool, String)>) -> Result<Action> {
+    fn into_action(self, typed: Vec<(bool, String)>) -> Result<Command> {
         let Flags {
             namespace,
             off,
@@ -267,6 +305,8 @@ impl Flags {
             edit,
             list,
             rm,
+            user,
+            project,
         } = self;
         let setting = !typed.is_empty();
 
@@ -307,6 +347,22 @@ impl Flags {
             bail!("--link cannot be combined with that action");
         }
 
+        // `--user` and `--project` are modifiers, not actions.
+        if user && project {
+            bail!("--user and --project cannot be combined");
+        }
+        if user && (off || init.is_some()) {
+            bail!(
+                "--user does not apply to --off or --init: it picks which namespace of a name to use"
+            );
+        }
+        if user && namespace.is_none() {
+            bail!("--user needs a namespace, and it comes first: envy <namespace> --user");
+        }
+        if project && !creating {
+            bail!("--project only works with --new: envy <namespace> --new --project");
+        }
+
         // Validate every namespace-like value before building anything.
         if let Some(ns) = &namespace {
             validate_namespace(ns)?;
@@ -340,9 +396,16 @@ impl Flags {
             items.push(item);
         }
 
+        let scope = if user {
+            Scope::User
+        } else if project {
+            Scope::Project
+        } else {
+            Scope::Auto
+        };
         let ns = namespace.clone();
         let need = || ns.clone().expect("namespace checked above");
-        Ok(if off {
+        let action = if off {
             Action::Off
         } else if let Some(shell) = init {
             if shell != "zsh" {
@@ -371,7 +434,8 @@ impl Flags {
                 (Some(ns), false) => Action::Activate(ns),
                 (None, _) => Action::Status,
             }
-        })
+        };
+        Ok(Command { action, scope })
     }
 }
 
@@ -379,8 +443,12 @@ impl Flags {
 mod tests {
     use super::*;
 
-    fn p(args: &[&str]) -> Result<Action> {
+    fn pc(args: &[&str]) -> Result<Command> {
         parse(std::iter::once("envy").chain(args.iter().copied()))
+    }
+
+    fn p(args: &[&str]) -> Result<Action> {
+        pc(args).map(|c| c.action)
     }
 
     fn s(v: &str) -> String {
@@ -936,6 +1004,258 @@ mod tests {
         ];
         for args in cases {
             assert!(p(args).is_err(), "expected error for {args:?}");
+        }
+    }
+
+    #[test]
+    fn user_and_project_flags_set_the_scope() {
+        let cases: Vec<(&[&str], Action, Scope)> = vec![
+            (&["dev", "--user"], Action::Activate(s("dev")), Scope::User),
+            (&["--user", "dev"], Action::Activate(s("dev")), Scope::User),
+            (&["dev"], Action::Activate(s("dev")), Scope::Auto),
+            (
+                &["dev", "--list", "--user"],
+                Action::List(s("dev")),
+                Scope::User,
+            ),
+            (
+                &["--user", "dev", "--ls"],
+                Action::List(s("dev")),
+                Scope::User,
+            ),
+            (
+                &["dev", "--new", "--user"],
+                Action::New {
+                    ns: s("dev"),
+                    like: None,
+                    link: None,
+                },
+                Scope::User,
+            ),
+            (
+                &["dev", "--new", "--project"],
+                Action::New {
+                    ns: s("dev"),
+                    like: None,
+                    link: None,
+                },
+                Scope::Project,
+            ),
+            (
+                &["--project", "dev", "--new"],
+                Action::New {
+                    ns: s("dev"),
+                    like: None,
+                    link: None,
+                },
+                Scope::Project,
+            ),
+            (
+                &["dev", "--like", "prod", "--project"],
+                Action::New {
+                    ns: s("dev"),
+                    like: Some(s("prod")),
+                    link: None,
+                },
+                Scope::Project,
+            ),
+            (
+                &["dev", "--secret", "A", "--user"],
+                set("dev", vec![sec("A")]),
+                Scope::User,
+            ),
+            (
+                &["dev", "--user", "--plain", "A"],
+                set("dev", vec![pl("A")]),
+                Scope::User,
+            ),
+            (
+                &["dev", "--edit", "--user"],
+                Action::Edit(s("dev")),
+                Scope::User,
+            ),
+            (
+                &["dev", "--rm", "--user"],
+                Action::Rm(s("dev")),
+                Scope::User,
+            ),
+            (
+                &["dev", "--unlink", "--user"],
+                Action::Unlink(s("dev")),
+                Scope::User,
+            ),
+            (
+                &["dev", "--link", "g", "--user"],
+                Action::Link {
+                    ns: s("dev"),
+                    group: s("g"),
+                },
+                Scope::User,
+            ),
+        ];
+        for (args, action, scope) in cases {
+            assert_eq!(pc(args).unwrap(), Command { action, scope }, "{args:?}");
+        }
+    }
+
+    #[test]
+    fn user_and_project_flags_are_rejected_where_they_make_no_sense() {
+        let cases: Vec<(&[&str], &str)> = vec![
+            (&["--user", "--off"], "--user"),
+            (&["--off", "--user"], "--user"),
+            (&["--init", "zsh", "--user"], "--user"),
+            (&["--user"], "--user"),
+            (&["--user", "--list"], "--user"),
+            (&["--list", "--user"], "--user"),
+            (&["dev", "--project"], "--project"),
+            (&["--project"], "--project"),
+            (&["dev", "--project", "--list"], "--project"),
+            (&["dev", "--project", "--rm"], "--project"),
+            (&["dev", "--project", "--edit"], "--project"),
+            (&["dev", "--project", "--secret", "A"], "--project"),
+            (&["dev", "--project", "--link", "g"], "--project"),
+            (&["--off", "--project"], "--project"),
+            (&["dev", "--new", "--user", "--project"], "--user"),
+            (&["dev", "--user", "--project"], "--user"),
+            (&["dev", "--user", "--user"], "--user"),
+            (&["dev", "--project", "--project", "--new"], "--project"),
+            (&["dev", "--user=x"], "--user"),
+        ];
+        for (args, mention) in cases {
+            let err = error_text(args);
+            assert!(err.contains(mention), "{args:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn user_and_project_errors_still_redact_after_an_equals_sign() {
+        let err = error_text(&["dev", "--user=hunter2-zq"]);
+        assert!(!err.contains("hunter2-zq"), "{err}");
+        let err = error_text(&["dev", "--user", "--secret", "--", "TOKEN=zq-abc"]);
+        assert!(!err.contains("zq-abc"), "{err}");
+    }
+
+    #[test]
+    fn help_documents_user_and_project() {
+        let help = clap_text(&["--help"]);
+        assert!(help.contains("--user"), "{help}");
+        assert!(help.contains("--project"), "{help}");
+        let flat = help.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            flat.contains(
+                "Use your own namespace even when the project has one with the same name"
+            ),
+            "{help}"
+        );
+        assert!(
+            flat.contains("With --new: create the namespace in this project's .envy/ folder"),
+            "{help}"
+        );
+        let after = help.split("--version").nth(1).expect("after the options");
+        assert!(
+            after.matches("--user").count() >= 1 && after.matches("--project").count() >= 1,
+            "{help}"
+        );
+    }
+
+    #[test]
+    fn wrapper_rule_agrees_with_the_parser() {
+        use crate::init::wrapper_evaluates;
+        let table: Vec<&[&str]> = vec![
+            &[],
+            &["dev"],
+            &["off"],
+            &["new"],
+            &["--off"],
+            &["dev", "--user"],
+            &["--user", "dev"],
+            &["--user"],
+            &["--user", "--user"],
+            &["--user", "--off"],
+            &["--off", "--user"],
+            &["--user", "-x"],
+            &["-x", "--user"],
+            &["dev", "--user", "--list"],
+            &["--list", "--user"],
+            &["--user", "--list"],
+            &["--user", "dev", "--list"],
+            &["dev", "--list", "--user"],
+            &["dev", "--list"],
+            &["dev", "--ls"],
+            &["--list"],
+            &["--ls"],
+            &["dev", "--secret", "A"],
+            &["dev", "--plain", "A=1"],
+            &["--init", "zsh"],
+            &["--init"],
+            &["dev", "--new"],
+            &["dev", "--new", "--user"],
+            &["dev", "--new", "--project"],
+            &["dev", "--user", "--project"],
+            &["dev", "--project"],
+            &["--project", "dev"],
+            &["--project"],
+            &["dev", "--edit"],
+            &["dev", "--rm"],
+            &["dev", "--link", "g"],
+            &["dev", "--unlink"],
+            &["dev", "--off"],
+            &["--off", "dev"],
+            &["--off", "--off"],
+            &["-x"],
+            &["-x", "dev"],
+            &["dev", "-x"],
+            &["--help"],
+            &["-h"],
+            &["--version"],
+            &["dev", "--help"],
+            &["--frobnicate"],
+            &["a", "b"],
+            &["dev", "--user", "extra"],
+            &["dev", "extra", "--user"],
+            &["--user", "dev", "--user"],
+            &["--user", "--user", "dev"],
+            &["dev", "--user", "--off"],
+            &["dev", "--user", "--rm"],
+            &["--", "dev"],
+            &["--", "-x"],
+            &["dev", "--"],
+            &["--user", "--"],
+            &["dev", "--user=1"],
+            &["--user=dev"],
+            &["--off=1"],
+            &["-"],
+            &["--user", "-"],
+        ];
+        assert!(table.len() >= 50);
+        // A single word that is not a valid name is passed to the binary by
+        // the wrapper, but the parse fails: the binary prints nothing to
+        // stdout, so nothing is evaluated (the function just returns 1).
+        for args in [
+            &["../x"][..],
+            &["bad name"],
+            &["dev=1"],
+            &[""],
+            &["--user", "dev=1"],
+            &["--user", ""],
+            &["--user", "../x"],
+        ] {
+            let owned: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+            assert!(wrapper_evaluates(&owned), "{args:?}");
+            assert!(pc(args).is_err(), "{args:?}");
+        }
+        for args in table {
+            let owned: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+            let parsed = pc(args);
+            let evaluated = matches!(
+                parsed.as_ref().map(|c| &c.action),
+                Ok(Action::Activate(_)) | Ok(Action::Off)
+            );
+            assert_eq!(
+                wrapper_evaluates(&owned),
+                evaluated,
+                "wrapper and parser disagree for {args:?}: parse = {parsed:?}"
+            );
         }
     }
 }

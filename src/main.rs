@@ -4,7 +4,7 @@ use std::process::ExitCode;
 
 use anyhow::{Result, bail};
 use envy::activate::{ActiveState, render_off};
-use envy::cli::{self, Action};
+use envy::cli::{self, Action, Command, Scope};
 use envy::commands::{self, Ctx};
 use envy::config::Config;
 use envy::editor;
@@ -143,6 +143,14 @@ fn run(action: Action) -> Result<String> {
     }
 }
 
+/// Until the flags are wired in, refuse them instead of ignoring them.
+fn scope_guard(command: &Command) -> Result<()> {
+    if command.scope != Scope::Auto {
+        bail!("--user and --project are not available yet");
+    }
+    Ok(())
+}
+
 fn write_stdout(text: &str) -> std::io::Result<()> {
     let mut out = std::io::stdout().lock();
     out.write_all(text.as_bytes())?;
@@ -151,8 +159,8 @@ fn write_stdout(text: &str) -> std::io::Result<()> {
 
 fn main() -> ExitCode {
     harden();
-    let action = match cli::parse(std::env::args_os()) {
-        Ok(action) => action,
+    let command = match cli::parse(std::env::args_os()) {
+        Ok(command) => command,
         Err(e) => {
             use clap::error::ErrorKind;
             return match e.downcast_ref::<clap::Error>() {
@@ -179,7 +187,7 @@ fn main() -> ExitCode {
             };
         }
     };
-    match run(action) {
+    match scope_guard(&command).and_then(|()| run(command.action)) {
         Ok(text) => match write_stdout(&text) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
@@ -217,6 +225,19 @@ mod tests {
                 err.contains("eval \"$(envy --init zsh)\""),
                 "{terminal} {marker:?}: {err}"
             );
+        }
+    }
+
+    #[test]
+    fn scope_flags_are_refused_until_they_are_wired() {
+        let cmd = |scope| Command {
+            action: Action::Activate("dev".into()),
+            scope,
+        };
+        assert!(scope_guard(&cmd(Scope::Auto)).is_ok());
+        for scope in [Scope::User, Scope::Project] {
+            let err = scope_guard(&cmd(scope)).unwrap_err().to_string();
+            assert!(err.contains("not available yet"), "{err}");
         }
     }
 
