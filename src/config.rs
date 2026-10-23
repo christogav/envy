@@ -26,6 +26,8 @@ pub enum Value {
 #[derive(Clone, Debug)]
 pub struct NamespaceFile {
     name: String,
+    /// The string the `SecretStore` is called with. Not part of the TOML.
+    secret_key: String,
     doc: DocumentMut,
 }
 
@@ -34,6 +36,7 @@ impl NamespaceFile {
         validate_namespace(name)?;
         Ok(Self {
             name: name.to_string(),
+            secret_key: name.to_string(),
             doc: DocumentMut::new(),
         })
     }
@@ -82,12 +85,19 @@ impl NamespaceFile {
         }
         Ok(Self {
             name: name.to_string(),
+            secret_key: name.to_string(),
             doc,
         })
     }
 
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// The key this namespace's secrets are filed under in the secret store:
+    /// the name at user level, `project/<identity>/<name>` in a project.
+    pub fn secret_key(&self) -> &str {
+        &self.secret_key
     }
 
     /// The TOML text, with the user's comments and ordering intact.
@@ -384,11 +394,58 @@ fn remove_link(doc: &mut DocumentMut) {
 #[derive(Clone, Debug)]
 pub struct Config {
     dir: PathBuf,
+    project: Option<ProjectInfo>,
+}
+
+/// What makes a `Config` project-level.
+#[derive(Clone, Debug)]
+struct ProjectInfo {
+    root: PathBuf,
+    identity: String,
+    user_dir: PathBuf,
 }
 
 impl Config {
     pub fn new(dir: PathBuf) -> Self {
-        Self { dir }
+        Self { dir, project: None }
+    }
+
+    /// A project's `.envy` directory (`dir`) inside `root`, whose secrets are
+    /// filed under `identity`. `user_dir` is the user's own config directory.
+    pub fn project(dir: PathBuf, root: PathBuf, identity: String, user_dir: PathBuf) -> Self {
+        Self {
+            dir,
+            project: Some(ProjectInfo {
+                root,
+                identity,
+                user_dir,
+            }),
+        }
+    }
+
+    pub fn is_project(&self) -> bool {
+        self.project.is_some()
+    }
+
+    pub fn identity(&self) -> Option<&str> {
+        self.project.as_ref().map(|p| p.identity.as_str())
+    }
+
+    pub fn root(&self) -> Option<&Path> {
+        self.project.as_ref().map(|p| p.root.as_path())
+    }
+
+    /// The user's config directory (`dir()` for a user-level config).
+    pub fn user_dir(&self) -> &Path {
+        self.project.as_ref().map_or(&self.dir, |p| &p.user_dir)
+    }
+
+    /// The secret-store key for namespace `ns` in this config.
+    pub fn secret_key(&self, ns: &str) -> String {
+        match &self.project {
+            Some(p) => format!("project/{}/{ns}", p.identity),
+            None => ns.to_string(),
+        }
     }
 
     /// `ENVY_CONFIG_DIR` if set (and non-empty; it must be absolute), else
@@ -450,17 +507,26 @@ impl Config {
             }
             Err(e) => return Err(e).with_context(|| format!("cannot read namespace {name:?}")),
         };
-        NamespaceFile::parse(name, &text)
+        let mut file = NamespaceFile::parse(name, &text)?;
+        file.secret_key = self.secret_key(name);
+        Ok(file)
     }
 
-    /// Atomically writes the file: temp file in the same directory (mode 0600),
-    /// then rename. The temp file is removed if anything fails.
+    /// Atomically writes the file: temp file in the same directory, then
+    /// rename. User-level files are mode 0600 in a 0700 directory; project
+    /// files are meant to be committed, so they are 0644 in a 0755 directory
+    /// (subject to the umask). The temp file is removed if anything fails.
     pub fn save(&self, file: &NamespaceFile) -> Result<()> {
         let name = file.name();
         let path = self.path_for(name)?;
+        let (dir_mode, file_mode) = if self.is_project() {
+            (0o755, 0o644)
+        } else {
+            (0o700, 0o600)
+        };
         fs::DirBuilder::new()
             .recursive(true)
-            .mode(0o700)
+            .mode(dir_mode)
             .create(&self.dir)
             .context("cannot create the envy config directory")?;
 
@@ -474,7 +540,7 @@ impl Config {
             let mut f = fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
-                .mode(0o600)
+                .mode(file_mode)
                 .open(&tmp)?;
             f.write_all(file.text().as_bytes())?;
             f.sync_all()?;
@@ -817,6 +883,7 @@ mod tests {
             assert!(cfg.exists(bad).is_err(), "exists {bad:?}");
             let forged = NamespaceFile {
                 name: bad.to_string(),
+                secret_key: bad.to_string(),
                 doc: DocumentMut::new(),
             };
             assert!(cfg.save(&forged).is_err(), "save {bad:?}");
@@ -870,6 +937,68 @@ mod tests {
         cfg.delete("work").unwrap();
         cfg.delete("work").unwrap();
         assert!(!cfg.exists("work").unwrap());
+    }
+
+    fn project_cfg(base: &Path, identity: &str) -> Config {
+        Config::project(
+            base.join("proj").join(".envy"),
+            base.join("proj"),
+            identity.to_string(),
+            base.join("user"),
+        )
+    }
+
+    #[test]
+    fn user_level_secret_key_is_the_name() {
+        let cfg = Config::new(PathBuf::from("/x/envy"));
+        assert_eq!(cfg.secret_key("dev"), "dev");
+        assert!(!cfg.is_project());
+        assert_eq!(cfg.identity(), None);
+        assert_eq!(cfg.root(), None);
+        assert_eq!(cfg.user_dir(), Path::new("/x/envy"));
+        assert_eq!(NamespaceFile::empty("dev").unwrap().secret_key(), "dev");
+        assert_eq!(NamespaceFile::parse("dev", "").unwrap().secret_key(), "dev");
+    }
+
+    #[test]
+    fn project_level_secret_key_is_prefixed() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = project_cfg(dir.path(), "acme/api");
+        assert_eq!(cfg.secret_key("dev"), "project/acme/api/dev");
+        assert!(cfg.is_project());
+        assert_eq!(cfg.identity(), Some("acme/api"));
+        assert_eq!(cfg.root(), Some(dir.path().join("proj").as_path()));
+        assert_eq!(cfg.dir(), dir.path().join("proj").join(".envy"));
+        assert_eq!(cfg.user_dir(), dir.path().join("user"));
+    }
+
+    #[test]
+    fn loaded_files_carry_their_secret_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_cfg(dir.path(), "acme/api");
+        project.save(&NamespaceFile::empty("dev").unwrap()).unwrap();
+        let loaded = project.load("dev").unwrap();
+        assert_eq!(loaded.secret_key(), "project/acme/api/dev");
+        assert_eq!(loaded.name(), "dev");
+        assert!(!loaded.text().contains("project/acme"));
+
+        let user = Config::new(dir.path().join("u"));
+        user.save(&NamespaceFile::empty("dev").unwrap()).unwrap();
+        assert_eq!(user.load("dev").unwrap().secret_key(), "dev");
+    }
+
+    #[test]
+    fn project_files_are_world_readable() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = project_cfg(dir.path(), "acme/api");
+        cfg.save(&NamespaceFile::empty("dev").unwrap()).unwrap();
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&cfg.dir().join("dev.toml")), 0o644);
+        assert_eq!(mode(cfg.dir()), 0o755);
+        let user = Config::new(dir.path().join("u"));
+        user.save(&NamespaceFile::empty("dev").unwrap()).unwrap();
+        assert_eq!(mode(&user.dir().join("dev.toml")), 0o600);
+        assert_eq!(mode(user.dir()), 0o700);
     }
 
     #[test]

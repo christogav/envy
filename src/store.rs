@@ -5,7 +5,10 @@ use anyhow::Result;
 
 use crate::secret::Secret;
 
-/// Storage for secret values, keyed by namespace and variable name.
+/// Storage for secret values, keyed by secret key and variable name. The key
+/// is the namespace name at user level and `project/<identity>/<namespace>`
+/// for a project namespace; the Keychain service becomes `envy.{key}`, e.g.
+/// `envy.project/acme/api/dev`.
 pub trait SecretStore {
     fn get(&self, ns: &str, name: &str) -> Result<Option<Secret>>;
     fn set(&self, ns: &str, name: &str, value: &Secret) -> Result<()>;

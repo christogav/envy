@@ -51,7 +51,7 @@ pub fn render_activate(
         let text = match value {
             Value::Plain(text) => text,
             Value::Secret => match store
-                .get(ns.name(), &name)
+                .get(ns.secret_key(), &name)
                 .with_context(|| format!("cannot read secret {name} for namespace {}", ns.name()))?
             {
                 Some(secret) => secret.expose().to_string(),
@@ -203,5 +203,33 @@ mod tests {
             render_off(&ActiveState::default()),
             "unset ENVY_ACTIVE ENVY_VARS\n"
         );
+    }
+
+    #[test]
+    fn render_activate_reads_the_project_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = crate::config::Config::project(
+            dir.path().join(".envy"),
+            dir.path().to_path_buf(),
+            "acme/api".into(),
+            dir.path().join("user"),
+        );
+        let mut f = NamespaceFile::empty("work").unwrap();
+        f.set_var("C", crate::config::Value::Secret).unwrap();
+        cfg.save(&f).unwrap();
+        let file = cfg.load("work").unwrap();
+
+        let store = MemoryStore::default();
+        store
+            .set("work", "C", &Secret::new("user-level".into()))
+            .unwrap();
+        let err = render_activate(&file, &ActiveState::default(), &store).unwrap_err();
+        assert!(format!("{err:#}").contains("namespace work"), "{err:#}");
+
+        store
+            .set("project/acme/api/work", "C", &Secret::new("proj".into()))
+            .unwrap();
+        let out = render_activate(&file, &ActiveState::default(), &store).unwrap();
+        assert!(out.ends_with("export C='proj'\n"), "{out}");
     }
 }

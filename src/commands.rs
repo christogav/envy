@@ -159,21 +159,24 @@ struct Undo {
     prior: Option<Secret>,
 }
 
+/// Per written namespace: its name, its secret key and what it replaced.
+type Written = Vec<(String, String, Vec<Undo>)>;
+
 /// Writes the secrets to the Keychain, remembering what they replaced. If a
 /// write fails, the ones already written are rolled back before returning.
-fn write_secrets(ctx: &Ctx, ns: &str, items: &[(String, Secret)]) -> Result<Vec<Undo>> {
+fn write_secrets(ctx: &Ctx, key: &str, items: &[(String, Secret)]) -> Result<Vec<Undo>> {
     let mut undo: Vec<Undo> = Vec::new();
     for (name, secret) in items {
         let step = ctx
             .store
-            .get(ns, name)
-            .and_then(|prior| ctx.store.set(ns, name, secret).map(|()| prior));
+            .get(key, name)
+            .and_then(|prior| ctx.store.set(key, name, secret).map(|()| prior));
         match step {
             Ok(prior) => undo.push(Undo {
                 name: name.clone(),
                 prior,
             }),
-            Err(e) => return Err(rollback(ctx, ns, undo, e)),
+            Err(e) => return Err(rollback(ctx, key, undo, e)),
         }
     }
     Ok(undo)
@@ -182,12 +185,12 @@ fn write_secrets(ctx: &Ctx, ns: &str, items: &[(String, Secret)]) -> Result<Vec<
 /// Restores the Keychain to what it was before `write_secrets`: items that did
 /// not exist are deleted, items that did are put back. Returns `cause`, with a
 /// note if the rollback itself could not finish.
-fn rollback(ctx: &Ctx, ns: &str, undo: Vec<Undo>, cause: anyhow::Error) -> anyhow::Error {
+fn rollback(ctx: &Ctx, key: &str, undo: Vec<Undo>, cause: anyhow::Error) -> anyhow::Error {
     let mut stuck: Vec<String> = Vec::new();
     for u in undo.into_iter().rev() {
         let result = match &u.prior {
-            Some(prior) => ctx.store.set(ns, &u.name, prior),
-            None => ctx.store.delete(ns, &u.name),
+            Some(prior) => ctx.store.set(key, &u.name, prior),
+            None => ctx.store.delete(key, &u.name),
         };
         if result.is_err() {
             stuck.push(u.name);
@@ -229,10 +232,11 @@ pub(crate) struct Change {
 /// 3. The Keychain items no file refers to any more. A failure here leaves
 ///    only unreferenced items behind, and says which.
 pub(crate) fn apply(ctx: &Ctx, changes: Vec<Change>) -> Result<()> {
-    let mut written: Vec<(String, Vec<Undo>)> = Vec::new();
+    let mut written: Written = Vec::new();
     for c in &changes {
-        match write_secrets(ctx, c.file.name(), &c.secrets) {
-            Ok(undo) => written.push((c.file.name().to_string(), undo)),
+        let key = ctx.cfg.secret_key(c.file.name());
+        match write_secrets(ctx, &key, &c.secrets) {
+            Ok(undo) => written.push((c.file.name().to_string(), key, undo)),
             Err(e) => return Err(rollback_all(ctx, written, &[], e)),
         }
     }
@@ -244,8 +248,9 @@ pub(crate) fn apply(ctx: &Ctx, changes: Vec<Change>) -> Result<()> {
     }
     let mut stuck: Vec<String> = Vec::new();
     for c in &changes {
+        let key = ctx.cfg.secret_key(c.file.name());
         for name in &c.delete {
-            if ctx.store.delete(c.file.name(), name).is_err() {
+            if ctx.store.delete(&key, name).is_err() {
                 stuck.push(format!("{}/{name}", c.file.name()));
             }
         }
@@ -263,14 +268,14 @@ pub(crate) fn apply(ctx: &Ctx, changes: Vec<Change>) -> Result<()> {
 /// (whose files could not be restored and still refer to the new items).
 fn rollback_all(
     ctx: &Ctx,
-    written: Vec<(String, Vec<Undo>)>,
+    written: Written,
     keep: &[String],
     cause: anyhow::Error,
 ) -> anyhow::Error {
     let mut err = cause;
-    for (ns, undo) in written.into_iter().rev() {
+    for (ns, key, undo) in written.into_iter().rev() {
         if !keep.contains(&ns) {
-            err = rollback(ctx, &ns, undo, err);
+            err = rollback(ctx, &key, undo, err);
         }
     }
     err
@@ -533,8 +538,9 @@ pub fn remove(ctx: &Ctx, ns: &str) -> Result<()> {
     if !ctx.prompt.confirm(&question)? {
         bail!("cancelled; nothing was changed");
     }
+    let key = file.secret_key();
     for name in &secrets {
-        ctx.store.delete(ns, name)?;
+        ctx.store.delete(key, name)?;
     }
     ctx.cfg.delete(ns)
 }
@@ -2735,5 +2741,100 @@ mod tests {
         .to_string();
         assert!(err.contains("changed while"), "{err}");
         assert_eq!(read(&dir, "work"), "[vars]\nTHEIRS = \"1\"\n");
+    }
+
+    fn project_cfg(base: &std::path::Path, identity: &str) -> Config {
+        Config::project(
+            base.join(".envy"),
+            base.to_path_buf(),
+            identity.to_string(),
+            base.join("user"),
+        )
+    }
+
+    fn secret_change(cfg: &Config, value: &str) -> Change {
+        let mut file = NamespaceFile::empty("dev").unwrap();
+        file.set_var("TOKEN", Value::Secret).unwrap();
+        let before = cfg.load("dev").ok();
+        Change {
+            file,
+            before,
+            secrets: vec![("TOKEN".into(), Secret::new(value.into()))],
+            delete: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn apply_with_a_project_config_uses_the_project_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = project_cfg(dir.path(), "acme/api");
+        let store = MemoryStore::default();
+        let prompt = ScriptedPrompter::new();
+        let ctx = Ctx {
+            cfg: &cfg,
+            store: &store,
+            prompt: &prompt,
+        };
+        apply(&ctx, vec![secret_change(&cfg, "v1")]).unwrap();
+        assert_eq!(
+            store.snapshot(),
+            vec![entry("project/acme/api/dev", "TOKEN", "v1")]
+        );
+        // Dropping the secret deletes the project item, not a bare one.
+        let mut change = secret_change(&cfg, "v1");
+        change.secrets.clear();
+        change.delete = vec!["TOKEN".into()];
+        apply(&ctx, vec![change]).unwrap();
+        assert!(store.snapshot().is_empty());
+    }
+
+    #[test]
+    fn two_projects_with_the_same_namespace_do_not_collide() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = project_cfg(&dir.path().join("a"), "acme/api");
+        let b = project_cfg(&dir.path().join("b"), "acme/web");
+        let user = Config::new(dir.path().join("user-cfg"));
+        let store = MemoryStore::default();
+        let prompt = ScriptedPrompter::new();
+        for (cfg, value) in [(&a, "va"), (&b, "vb"), (&user, "vu")] {
+            let ctx = Ctx {
+                cfg,
+                store: &store,
+                prompt: &prompt,
+            };
+            apply(&ctx, vec![secret_change(cfg, value)]).unwrap();
+        }
+        assert_eq!(
+            store.snapshot(),
+            vec![
+                entry("dev", "TOKEN", "vu"),
+                entry("project/acme/api/dev", "TOKEN", "va"),
+                entry("project/acme/web/dev", "TOKEN", "vb"),
+            ]
+        );
+        let render = |cfg: &Config| activate(cfg, &store, "dev", &ActiveState::default()).unwrap();
+        assert!(render(&a).ends_with("export TOKEN='va'\n"));
+        assert!(render(&b).ends_with("export TOKEN='vb'\n"));
+        assert!(render(&user).ends_with("export TOKEN='vu'\n"));
+
+        // Removing one leaves the others untouched.
+        let yes = ScriptedPrompter::new().with_confirm(true);
+        remove(
+            &Ctx {
+                cfg: &a,
+                store: &store,
+                prompt: &yes,
+            },
+            "dev",
+        )
+        .unwrap();
+        assert_eq!(
+            store.snapshot(),
+            vec![
+                entry("dev", "TOKEN", "vu"),
+                entry("project/acme/web/dev", "TOKEN", "vb"),
+            ]
+        );
+        assert!(!a.exists("dev").unwrap());
     }
 }
