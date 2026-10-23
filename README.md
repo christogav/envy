@@ -252,3 +252,7 @@ $ cargo clippy --all-targets -- -D warnings
 
 One test talks to your real login Keychain, so it is ignored by default. Run it
 once with `cargo test -- --ignored mac_keychain_roundtrip`.
+
+## License
+
+[MIT](LICENSE)
