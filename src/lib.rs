@@ -6,6 +6,7 @@ pub mod editor;
 pub mod init;
 pub mod link;
 pub mod names;
+pub mod project;
 pub mod prompt;
 pub mod quote;
 pub mod secret;
