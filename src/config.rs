@@ -1,6 +1,6 @@
 use std::ffi::OsString;
 use std::fs;
-use std::io::{ErrorKind, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -9,6 +9,7 @@ use anyhow::{Context, Result, bail};
 use toml_edit::{DocumentMut, Item, Table, TableLike};
 
 use crate::names::{validate_namespace, validate_var};
+use crate::project::encode_path;
 
 /// The value that marks a variable as a secret stored in the Keychain.
 pub const SECRET_MARKER: &str = "@keychain";
@@ -26,6 +27,8 @@ pub enum Value {
 #[derive(Clone, Debug)]
 pub struct NamespaceFile {
     name: String,
+    /// The string the `SecretStore` is called with. Not part of the TOML.
+    secret_key: String,
     doc: DocumentMut,
 }
 
@@ -34,6 +37,7 @@ impl NamespaceFile {
         validate_namespace(name)?;
         Ok(Self {
             name: name.to_string(),
+            secret_key: name.to_string(),
             doc: DocumentMut::new(),
         })
     }
@@ -82,12 +86,19 @@ impl NamespaceFile {
         }
         Ok(Self {
             name: name.to_string(),
+            secret_key: name.to_string(),
             doc,
         })
     }
 
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// The key this namespace's secrets are filed under in the secret store:
+    /// the name at user level, `project/<identity>/<name>` in a project.
+    pub fn secret_key(&self) -> &str {
+        &self.secret_key
     }
 
     /// The TOML text, with the user's comments and ordering intact.
@@ -384,11 +395,61 @@ fn remove_link(doc: &mut DocumentMut) {
 #[derive(Clone, Debug)]
 pub struct Config {
     dir: PathBuf,
+    project: Option<ProjectInfo>,
+}
+
+/// What makes a `Config` project-level.
+#[derive(Clone, Debug)]
+struct ProjectInfo {
+    root: PathBuf,
+    identity: String,
+    user_dir: PathBuf,
 }
 
 impl Config {
     pub fn new(dir: PathBuf) -> Self {
-        Self { dir }
+        Self { dir, project: None }
+    }
+
+    /// The caller must already have validated `identity` (`project::identity_for_root`
+    /// guarantees it); it is used verbatim in secret keys.
+    ///
+    /// A project's `.envy` directory (`dir`) inside `root`, whose secrets are
+    /// filed under `identity`. `user_dir` is the user's own config directory.
+    pub fn project(dir: PathBuf, root: PathBuf, identity: String, user_dir: PathBuf) -> Self {
+        Self {
+            dir,
+            project: Some(ProjectInfo {
+                root,
+                identity,
+                user_dir,
+            }),
+        }
+    }
+
+    pub fn is_project(&self) -> bool {
+        self.project.is_some()
+    }
+
+    pub fn identity(&self) -> Option<&str> {
+        self.project.as_ref().map(|p| p.identity.as_str())
+    }
+
+    pub fn root(&self) -> Option<&Path> {
+        self.project.as_ref().map(|p| p.root.as_path())
+    }
+
+    /// The user's config directory (`dir()` for a user-level config).
+    pub fn user_dir(&self) -> &Path {
+        self.project.as_ref().map_or(&self.dir, |p| &p.user_dir)
+    }
+
+    /// The secret-store key for namespace `ns` in this config.
+    pub fn secret_key(&self, ns: &str) -> String {
+        match &self.project {
+            Some(p) => format!("project/{}/{ns}", p.identity),
+            None => ns.to_string(),
+        }
     }
 
     /// `ENVY_CONFIG_DIR` if set (and non-empty; it must be absolute), else
@@ -412,6 +473,17 @@ impl Config {
 
     /// Sorted names of the namespace files; stray files are ignored.
     pub fn list(&self) -> Result<Vec<String>> {
+        self.list_names(true)
+    }
+
+    /// Like `list`, but includes every `*.toml` entry with a valid namespace
+    /// stem whatever its type (directory, symlink, ...). Project levels use
+    /// this so a bad entry is reported instead of hidden.
+    pub fn list_present(&self) -> Result<Vec<String>> {
+        self.list_names(false)
+    }
+
+    fn list_names(&self, files_only: bool) -> Result<Vec<String>> {
         let entries = match fs::read_dir(&self.dir) {
             Ok(entries) => entries,
             Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
@@ -424,7 +496,7 @@ impl Config {
             let Some(stem) = file_name.to_str().and_then(|n| n.strip_suffix(".toml")) else {
                 continue;
             };
-            if validate_namespace(stem).is_ok() && entry.path().is_file() {
+            if validate_namespace(stem).is_ok() && (!files_only || entry.path().is_file()) {
                 names.push(stem.to_string());
             }
         }
@@ -441,26 +513,59 @@ impl Config {
         }
     }
 
-    pub fn load(&self, name: &str) -> Result<NamespaceFile> {
+    /// Whether any directory entry exists for `name` (a file, directory,
+    /// dangling symlink, ...). Unlike `exists` it never follows symlinks, so
+    /// project levels use it to fail closed on anything odd.
+    pub fn present(&self, name: &str) -> Result<bool> {
         let path = self.path_for(name)?;
-        let text = match fs::read_to_string(&path) {
-            Ok(text) => text,
-            Err(e) if e.kind() == ErrorKind::NotFound => {
-                bail!("namespace {name:?} does not exist (use --new to create it)")
-            }
-            Err(e) => return Err(e).with_context(|| format!("cannot read namespace {name:?}")),
-        };
-        NamespaceFile::parse(name, &text)
+        match fs::symlink_metadata(&path) {
+            Ok(_) => Ok(true),
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e).with_context(|| format!("cannot access namespace {name:?}")),
+        }
     }
 
-    /// Atomically writes the file: temp file in the same directory (mode 0600),
-    /// then rename. The temp file is removed if anything fails.
+    pub fn load(&self, name: &str) -> Result<NamespaceFile> {
+        let path = self.path_for(name)?;
+        let project = self.is_project();
+        let text = if project {
+            read_project_file(name, &path)?
+        } else {
+            match fs::read_to_string(&path) {
+                Ok(text) => text,
+                Err(e) if e.kind() == ErrorKind::NotFound => {
+                    bail!("namespace {name:?} does not exist (use --new to create it)")
+                }
+                Err(e) => {
+                    return Err(e).with_context(|| format!("cannot read namespace {name:?}"));
+                }
+            }
+        };
+        let mut file = if project {
+            NamespaceFile::parse(name, &text)
+                .map_err(|e| anyhow::anyhow!("{e} ({})", encode_path(&path)))?
+        } else {
+            NamespaceFile::parse(name, &text)?
+        };
+        file.secret_key = self.secret_key(name);
+        Ok(file)
+    }
+
+    /// Atomically writes the file: temp file in the same directory, then
+    /// rename. User-level files are mode 0600 in a 0700 directory; project
+    /// files are meant to be committed, so they are 0644 in a 0755 directory
+    /// (subject to the umask). The temp file is removed if anything fails.
     pub fn save(&self, file: &NamespaceFile) -> Result<()> {
         let name = file.name();
         let path = self.path_for(name)?;
+        let (dir_mode, file_mode) = if self.is_project() {
+            (0o755, 0o644)
+        } else {
+            (0o700, 0o600)
+        };
         fs::DirBuilder::new()
             .recursive(true)
-            .mode(0o700)
+            .mode(dir_mode)
             .create(&self.dir)
             .context("cannot create the envy config directory")?;
 
@@ -474,7 +579,7 @@ impl Config {
             let mut f = fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
-                .mode(0o600)
+                .mode(file_mode)
                 .open(&tmp)?;
             f.write_all(file.text().as_bytes())?;
             f.sync_all()?;
@@ -497,6 +602,49 @@ impl Config {
             Err(e) => Err(e).with_context(|| format!("cannot delete namespace {name:?}")),
         }
     }
+}
+
+/// The largest project namespace file envy reads.
+pub(crate) const MAX_PROJECT_FILE: usize = 1024 * 1024;
+
+/// Reads a project namespace file, which the repository controls: never
+/// through a symlink (`O_NOFOLLOW`, so a swap after the check is refused too),
+/// only a regular file (checked on the open handle; `O_NONBLOCK` keeps a FIFO
+/// from blocking the open), and at most [`MAX_PROJECT_FILE`] bytes. Errors
+/// name the file with its path percent-encoded.
+fn read_project_file(name: &str, path: &Path) -> Result<String> {
+    let shown = encode_path(path);
+    let symlink =
+        || anyhow::anyhow!("refusing project namespace {name:?} ({shown}): it is a symlink");
+    if fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err(symlink());
+    }
+    let cannot_read = || format!("cannot read project namespace {name:?} ({shown})");
+    let file = match fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            bail!("namespace {name:?} does not exist (use --new to create it)")
+        }
+        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => return Err(symlink()),
+        Err(e) => return Err(e).with_context(cannot_read),
+    };
+    if !file.metadata().with_context(cannot_read)?.is_file() {
+        bail!("refusing project namespace {name:?} ({shown}): it is not a regular file");
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_PROJECT_FILE as u64 + 1)
+        .read_to_end(&mut bytes)
+        .with_context(cannot_read)?;
+    if bytes.len() > MAX_PROJECT_FILE {
+        bail!("refusing project namespace {name:?} ({shown}): it is larger than 1 MiB");
+    }
+    String::from_utf8(bytes).map_err(|_| {
+        anyhow::anyhow!("cannot read project namespace {name:?} ({shown}): it is not UTF-8")
+    })
 }
 
 fn dir_from_env(config_dir: Option<OsString>, home: Option<OsString>) -> Result<PathBuf> {
@@ -523,6 +671,57 @@ fn dir_from_env(config_dir: Option<OsString>, home: Option<OsString>) -> Result<
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn project_load_refuses_a_symlinked_file_and_names_the_path() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cfg = project_cfg(tmp.path(), "acme/api");
+        fs::create_dir_all(cfg.dir()).unwrap();
+        let real = tmp.path().join("real.toml");
+        fs::write(&real, "[vars]\nA = \"1\"\n").unwrap();
+        let link = cfg.dir().join("dev.toml");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let err = format!("{:#}", cfg.load("dev").unwrap_err());
+        assert!(
+            err.contains("symlink") && err.contains(&link.display().to_string()),
+            "{err}"
+        );
+        assert!(cfg.present("dev").unwrap());
+        // The user level is unchanged: it still follows symlinks.
+        let user = Config::new(cfg.dir().to_path_buf());
+        assert!(user.load("dev").is_ok());
+    }
+
+    #[test]
+    fn project_load_errors_name_the_path_not_the_contents() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cfg = project_cfg(tmp.path(), "acme/api");
+        fs::create_dir_all(cfg.dir()).unwrap();
+        let p = cfg.dir().join("dev.toml");
+        fs::write(&p, "SECRET_VALUE = [oops").unwrap();
+        let err = format!("{:#}", cfg.load("dev").unwrap_err());
+        assert!(
+            err.contains(&p.display().to_string()) && !err.contains("SECRET_VALUE"),
+            "{err}"
+        );
+        fs::remove_file(&p).unwrap();
+        fs::create_dir(&p).unwrap();
+        let err = format!("{:#}", cfg.load("dev").unwrap_err());
+        assert!(err.contains(&p.display().to_string()), "{err}");
+    }
+
+    #[test]
+    fn present_sees_any_directory_entry() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cfg = project_cfg(tmp.path(), "acme/api");
+        fs::create_dir_all(cfg.dir()).unwrap();
+        assert!(!cfg.present("dev").unwrap());
+        std::os::unix::fs::symlink("/nonexistent/x", cfg.dir().join("dev.toml")).unwrap();
+        assert!(cfg.present("dev").unwrap() && !cfg.exists("dev").unwrap());
+        fs::create_dir(cfg.dir().join("ci.toml")).unwrap();
+        assert_eq!(cfg.list_present().unwrap(), vec!["ci", "dev"]);
+        assert!(cfg.list().unwrap().is_empty());
+    }
 
     const SAMPLE: &str = "link = \"aws\"\n\n[vars]\nAWS_REGION = \"eu-west-1\"\nGITHUB_TOKEN = \"@keychain\"\nA = \"x\"\n";
 
@@ -758,6 +957,50 @@ mod tests {
     }
 
     #[test]
+    fn project_load_errors_escape_a_hostile_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("ev\u{1b}[31mil\n\u{202e}x");
+        let cfg = Config::project(
+            root.join(".envy"),
+            root.clone(),
+            "acme/api".into(),
+            tmp.path().join("user"),
+        );
+        fs::create_dir_all(cfg.dir()).unwrap();
+        let file = cfg.dir().join("dev.toml");
+        let check = |what: &str| {
+            let err = cfg.load("dev").unwrap_err();
+            let text = format!("{err:#} {err:?}");
+            assert!(
+                text.contains("ev%1B%5B31mil%0A%E2%80%AEx"),
+                "{what}: {text}"
+            );
+            assert!(
+                !format!("{err:#}")
+                    .chars()
+                    .any(|c| c.is_control() || c == '\u{202e}'),
+                "{what}: {err:#}"
+            );
+        };
+        fs::write(&file, "not [toml").unwrap();
+        check("garbage");
+        fs::remove_file(&file).unwrap();
+        std::os::unix::fs::symlink("/nonexistent", &file).unwrap();
+        check("symlink");
+        fs::remove_file(&file).unwrap();
+        fs::create_dir(&file).unwrap();
+        check("directory");
+    }
+
+    #[test]
+    fn a_file_cannot_define_envy_source() {
+        let err = NamespaceFile::parse("w", "[vars]\nENVY_SOURCE = \"user\"\n").unwrap_err();
+        assert!(format!("{err:#}").contains("ENVY_SOURCE"), "{err:#}");
+        let mut f = NamespaceFile::empty("w").unwrap();
+        assert!(f.set_var("ENVY_SOURCE", Value::Secret).is_err());
+    }
+
+    #[test]
     fn existing_file_with_a_special_parameter_fails_to_parse_naming_it() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(
@@ -817,6 +1060,7 @@ mod tests {
             assert!(cfg.exists(bad).is_err(), "exists {bad:?}");
             let forged = NamespaceFile {
                 name: bad.to_string(),
+                secret_key: bad.to_string(),
                 doc: DocumentMut::new(),
             };
             assert!(cfg.save(&forged).is_err(), "save {bad:?}");
@@ -872,6 +1116,75 @@ mod tests {
         assert!(!cfg.exists("work").unwrap());
     }
 
+    fn project_cfg(base: &Path, identity: &str) -> Config {
+        Config::project(
+            base.join("proj").join(".envy"),
+            base.join("proj"),
+            identity.to_string(),
+            base.join("user"),
+        )
+    }
+
+    #[test]
+    fn user_level_secret_key_is_the_name() {
+        let cfg = Config::new(PathBuf::from("/x/envy"));
+        assert_eq!(cfg.secret_key("dev"), "dev");
+        assert!(!cfg.is_project());
+        assert_eq!(cfg.identity(), None);
+        assert_eq!(cfg.root(), None);
+        assert_eq!(cfg.user_dir(), Path::new("/x/envy"));
+        assert_eq!(NamespaceFile::empty("dev").unwrap().secret_key(), "dev");
+        assert_eq!(NamespaceFile::parse("dev", "").unwrap().secret_key(), "dev");
+    }
+
+    #[test]
+    fn project_level_secret_key_is_prefixed() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = project_cfg(dir.path(), "acme/api");
+        assert_eq!(cfg.secret_key("dev"), "project/acme/api/dev");
+        assert!(cfg.is_project());
+        assert_eq!(cfg.identity(), Some("acme/api"));
+        assert_eq!(cfg.root(), Some(dir.path().join("proj").as_path()));
+        assert_eq!(cfg.dir(), dir.path().join("proj").join(".envy"));
+        assert_eq!(cfg.user_dir(), dir.path().join("user"));
+    }
+
+    #[test]
+    fn loaded_files_carry_their_secret_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_cfg(dir.path(), "acme/api");
+        project.save(&NamespaceFile::empty("dev").unwrap()).unwrap();
+        let loaded = project.load("dev").unwrap();
+        assert_eq!(loaded.secret_key(), "project/acme/api/dev");
+        assert_eq!(loaded.name(), "dev");
+        assert!(!loaded.text().contains("project/acme"));
+
+        let user = Config::new(dir.path().join("u"));
+        user.save(&NamespaceFile::empty("dev").unwrap()).unwrap();
+        assert_eq!(user.load("dev").unwrap().secret_key(), "dev");
+    }
+
+    #[test]
+    fn project_files_are_world_readable() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = project_cfg(dir.path(), "acme/api");
+        cfg.save(&NamespaceFile::empty("dev").unwrap()).unwrap();
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        // Project files honour the umask: owner keeps access, never wider
+        // than 0644 (files) or 0755 (directory).
+        let file = mode(&cfg.dir().join("dev.toml"));
+        assert_eq!(file & 0o600, 0o600, "{file:o}");
+        assert_eq!(file & !0o644, 0, "{file:o}");
+        let folder = mode(cfg.dir());
+        assert_eq!(folder & 0o700, 0o700, "{folder:o}");
+        assert_eq!(folder & !0o755, 0, "{folder:o}");
+        // User level uses explicit modes.
+        let user = Config::new(dir.path().join("u"));
+        user.save(&NamespaceFile::empty("dev").unwrap()).unwrap();
+        assert_eq!(mode(&user.dir().join("dev.toml")), 0o600);
+        assert_eq!(mode(user.dir()), 0o700);
+    }
+
     #[test]
     fn failed_save_leaves_no_temp_file() {
         let dir = tempfile::tempdir().unwrap();
@@ -914,6 +1227,102 @@ mod tests {
         assert_eq!(
             dir_from_env(o(""), o("/h")).unwrap(),
             PathBuf::from("/h/.config/envy")
+        );
+    }
+
+    #[test]
+    fn an_existing_file_with_an_envy_prefixed_name_fails_to_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config::new(dir.path().to_path_buf());
+        fs::write(
+            dir.path().join("evil.toml"),
+            "[vars]\nENVY_CONFIG_DIR = \"/tmp/zq-x\"\n",
+        )
+        .unwrap();
+        let err = format!("{:#}", cfg.load("evil").unwrap_err());
+        assert!(
+            err.contains("ENVY_ prefix") && !err.contains("zq-x"),
+            "{err}"
+        );
+        fs::write(dir.path().join("ok.toml"), "[vars]\nenvy_x = \"1\"\n").unwrap();
+        assert_eq!(
+            cfg.load("ok").unwrap().vars(),
+            vec![("envy_x".to_string(), Value::Plain("1".into()))]
+        );
+    }
+
+    fn project_level() -> (tempfile::TempDir, Config) {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap().join("repo");
+        let cfg = Config::project(
+            root.join(".envy"),
+            root.clone(),
+            "acme/api".into(),
+            tmp.path().join("user"),
+        );
+        fs::create_dir_all(cfg.dir()).unwrap();
+        (tmp, cfg)
+    }
+
+    /// `cfg.load(ns)` on another thread; fails the test if it blocks.
+    fn load_promptly(cfg: &Config, ns: &str) -> Result<NamespaceFile> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (cfg, ns) = (cfg.clone(), ns.to_string());
+        std::thread::spawn(move || {
+            let _ = tx.send(cfg.load(&ns));
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("loading the namespace blocked")
+    }
+
+    #[test]
+    fn project_load_refuses_a_fifo_without_blocking() {
+        let (_tmp, cfg) = project_level();
+        let fifo = cfg.dir().join("fifo.toml");
+        let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
+        let err = format!("{:#}", load_promptly(&cfg, "fifo").unwrap_err());
+        assert!(
+            err.contains("not a regular file") && err.contains(&encode_path(&fifo)),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn project_load_has_a_size_limit() {
+        let (_tmp, cfg) = project_level();
+        let path = cfg.dir().join("big.toml");
+        // A comment line padded to exactly the limit parses.
+        let mut text = "# ".to_string();
+        text.push_str(&"x".repeat(MAX_PROJECT_FILE - 3));
+        text.push('\n');
+        assert_eq!(text.len(), MAX_PROJECT_FILE);
+        fs::write(&path, &text).unwrap();
+        assert!(load_promptly(&cfg, "big").unwrap().vars().is_empty());
+        // One byte more is refused, naming the file and the limit.
+        text.insert(0, ' ');
+        fs::write(&path, &text).unwrap();
+        let err = format!("{:#}", load_promptly(&cfg, "big").unwrap_err());
+        assert!(
+            err.contains("larger than 1 MiB") && err.contains(&encode_path(&path)),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn project_load_still_names_a_symlink() {
+        let (_tmp, cfg) = project_level();
+        let real = cfg.dir().join("real.txt");
+        fs::write(&real, "[vars]\nA = \"1\"\n").unwrap();
+        std::os::unix::fs::symlink(&real, cfg.dir().join("dev.toml")).unwrap();
+        let err = format!("{:#}", cfg.load("dev").unwrap_err());
+        assert!(err.contains("symlink") && err.contains("dev.toml"), "{err}");
+        assert!(
+            cfg.load("nope")
+                .unwrap_err()
+                .to_string()
+                .contains("does not exist")
         );
     }
 }

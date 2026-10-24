@@ -43,6 +43,7 @@ fn zsh_raw(config: &Path, script: &str) -> Output {
         .env("PATH", path_with_envy())
         .env("ENVY_CONFIG_DIR", config)
         .env("HOME", config)
+        .current_dir(config)
         .env_remove("ENVY_ACTIVE")
         .env_remove("ENVY_VARS")
         .env_remove("ENVY_EVAL")
@@ -163,6 +164,8 @@ fn binary_prints_nothing_to_stdout_on_failure() {
         let out = Command::new(ENVY)
             .args(args)
             .env("ENVY_CONFIG_DIR", dir.path())
+            .env("HOME", dir.path())
+            .current_dir(dir.path())
             .env("ENVY_EVAL", "1")
             .output()
             .unwrap();
@@ -178,6 +181,7 @@ fn envy(config: &Path, args: &[&str]) -> Output {
         .args(args)
         .env("ENVY_CONFIG_DIR", config)
         .env("HOME", config)
+        .current_dir(config)
         .stdin(std::process::Stdio::null())
         .output()
         .unwrap()
@@ -292,6 +296,8 @@ fn edit_with_failing_editor_or_bad_result_changes_nothing() {
         let out = Command::new(ENVY)
             .args(["work", "--edit"])
             .env("ENVY_CONFIG_DIR", dir.path())
+            .env("HOME", dir.path())
+            .current_dir(dir.path())
             .env("VISUAL", &script)
             .stdin(std::process::Stdio::null())
             .output()
@@ -318,6 +324,8 @@ fn edit_that_changes_nothing_says_so() {
     let out = Command::new(ENVY)
         .args(["work", "--edit"])
         .env("ENVY_CONFIG_DIR", dir.path())
+        .env("HOME", dir.path())
+        .current_dir(dir.path())
         .env("VISUAL", &script)
         .stdin(std::process::Stdio::null())
         .output()
@@ -374,6 +382,8 @@ fn ctrl_c_in_the_editor_does_not_kill_envy() {
     let mut child = Command::new(ENVY)
         .args(["work", "--edit"])
         .env("ENVY_CONFIG_DIR", dir.path())
+        .env("HOME", dir.path())
+        .current_dir(dir.path())
         .env("VISUAL", &script)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -600,12 +610,18 @@ fn several_plain_items_are_saved_in_one_command_and_load() {
 /// closed, killed if it has not finished within 10 seconds. A regression
 /// that reaches a prompt fails fast instead of hanging or asking.
 fn envy_detached(config: &Path, args: &[&str]) -> Output {
-    use std::os::unix::process::CommandExt;
     let mut cmd = Command::new(ENVY);
     cmd.args(args)
         .env("ENVY_CONFIG_DIR", config)
         .env("HOME", config)
-        .stdin(std::process::Stdio::null())
+        .current_dir(config);
+    detached(cmd)
+}
+
+/// Runs `cmd` with no terminal (see [`envy_detached`]).
+fn detached(mut cmd: Command) -> Output {
+    use std::os::unix::process::CommandExt;
+    cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
     // SAFETY: `setsid` is async-signal-safe and touches no memory.
@@ -749,7 +765,7 @@ fn list_commands_print_to_stdout_and_are_not_evaluated() {
     assert!(out.status.success(), "{}", stderr(&out));
     let names = "  dev\n  personal\n  work\n";
     let marked = "* dev\n  personal\n  work\n";
-    let vars = "namespace: dev (active)\nlink: aws\n\nREGION   \"eu\\tx\"\nEMPTY    \"\"\nHOSTILE  \"\\u{1b}[31mred\\u{e0041}\"\n";
+    let vars = "namespace: dev (active)\nsource: user\nlink: aws\n\nREGION   \"eu\\tx\"\nEMPTY    \"\"\nHOSTILE  \"\\u{1b}[31mred\\u{e0041}\"\n";
     assert_eq!(stdout(&out), format!("{marked}{marked}{vars}"));
     assert_eq!(stderr(&out), "");
 
@@ -774,4 +790,796 @@ fn list_of_an_unknown_namespace_fails_with_the_hint_on_stderr() {
     assert_eq!(stdout(&out), "");
     let err = stderr(&out);
     assert!(err.contains("bogus") && err.contains("--new"), "{err}");
+}
+
+/// A word quoted for a zsh script: any text, `'` included.
+fn sh_quote(word: &str) -> String {
+    format!("'{}'", word.replace('\'', r"'\''"))
+}
+
+/// Runs each argv through the real shell function with a STUB `envy` on the
+/// `PATH` that prints `print -r -- EVALUATED`. If the function evaluates the
+/// output, the line is `EVALUATED`; if it only runs the stub, the line is the
+/// literal `print -r -- EVALUATED`. `prelude` runs before the calls (to set
+/// options). Also returns, per call, the arguments the stub received, as
+/// `<count>` then ` [arg]` each, so a word that the function split, globbed
+/// or expanded shows up.
+fn wrapper_outcomes_with(prelude: &str, argvs: &[&[&str]]) -> (Vec<String>, Vec<String>) {
+    let stub_dir = tempfile::tempdir().unwrap();
+    let stub = stub_dir.path().join("envy");
+    let log = stub_dir.path().join("args.log");
+    std::fs::write(
+        &stub,
+        "#!/bin/sh\n{ printf '%s' \"$#\"; for a in \"$@\"; do printf ' [%s]' \"$a\"; done; printf '\\n'; } >> \"$STUB_LOG\"\necho 'print -r -- EVALUATED'\n",
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    // The function text comes from the real binary, run before the stub.
+    let function = String::from_utf8(
+        Command::new(ENVY)
+            .args(["--init", "zsh"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    let mut script = function;
+    script.push_str(prelude);
+    script.push('\n');
+    for args in argvs {
+        let quoted: Vec<String> = args.iter().map(|a| sh_quote(a)).collect();
+        script.push_str(&format!("envy {}\n", quoted.join(" ")));
+    }
+    let out = Command::new("zsh")
+        .args(["-f", "-c", &script])
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                stub_dir.path().display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .env("STUB_LOG", &log)
+        .current_dir(stub_dir.path())
+        .env_remove("ENVY_EVAL")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", stderr(&out));
+    let lines = stdout(&out).lines().map(str::to_string).collect();
+    let seen = std::fs::read_to_string(&log)
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect();
+    (lines, seen)
+}
+
+/// What the stub logs for `args` (see [`wrapper_outcomes_with`]).
+fn logged(args: &[&str]) -> String {
+    let mut line = args.len().to_string();
+    for a in args {
+        line.push_str(&format!(" [{a}]"));
+    }
+    line
+}
+
+fn check_wrapper(prelude: &str) {
+    let evaluated: &[&[&str]] = &[
+        &["dev", "--user"],
+        &["--user", "dev"],
+        &["dev"],
+        &["--off"],
+        &["*"],
+        &["$HOME"],
+        &[""],
+        &["a b"],
+        &["*", "--user"],
+        &["--user", "a b"],
+    ];
+    let shown: &[&[&str]] = &[
+        &["dev", "--user", "--list"],
+        &["--list", "--user"],
+        &["dev", "--list"],
+        &["--user", "--off"],
+        &["dev", "--secret", "A"],
+        &["--init", "zsh"],
+        &["--user"],
+        &["dev", "--new", "--project"],
+        &["*", "--list"],
+        &["a b", "--list"],
+    ];
+    let all: Vec<&[&str]> = evaluated.iter().chain(shown).copied().collect();
+    let (lines, seen) = wrapper_outcomes_with(prelude, &all);
+    assert_eq!(lines.len(), all.len(), "{prelude}: {lines:?}");
+    for (args, line) in all.iter().zip(&lines) {
+        let want = evaluated.contains(args);
+        assert_eq!(line == "EVALUATED", want, "{prelude}: {args:?}: {line}");
+        if !want {
+            assert_eq!(line, "print -r -- EVALUATED", "{prelude}: {args:?}");
+        }
+    }
+    // Every word reached the binary exactly as typed.
+    let want: Vec<String> = all.iter().map(|a| logged(a)).collect();
+    assert_eq!(seen, want, "{prelude}");
+}
+
+#[test]
+fn user_flag_forms_are_evaluated_and_other_shapes_are_not() {
+    check_wrapper("");
+}
+
+#[test]
+fn the_wrapper_is_unaffected_by_the_callers_options() {
+    check_wrapper("setopt ksh_arrays sh_word_split");
+    check_wrapper("setopt ksh_arrays sh_word_split glob_subst nonomatch");
+}
+
+// ---- project levels ----
+//
+// A temp home with a temp repository (`home/work/api`, origin
+// `git@github.com:acme/api.git`), the user level outside it, and every
+// command run with no terminal: a confirmation or a hidden prompt would fail
+// the command instead of waiting. Plain variables only (see the top of the
+// file). Trust is recorded through the library, as a "yes" would record it.
+
+use envy::config::Config;
+use envy::project::{encode_path, identity_for_root};
+use envy::trust::TrustStore;
+use std::path::PathBuf;
+
+const SHADOW: &str =
+    "note: project namespace \"dev\" shadows your user-level \"dev\"; use --user for yours\n";
+
+struct Proj {
+    _tmp: TempDir,
+    home: PathBuf,
+    user: PathBuf,
+    repo: PathBuf,
+}
+
+fn git_repo(dir: &Path, remotes: &[(&str, &str)]) {
+    std::fs::create_dir_all(dir.join(".git")).unwrap();
+    let mut config = String::new();
+    for (name, url) in remotes {
+        config.push_str(&format!("[remote \"{name}\"]\n\turl = {url}\n"));
+    }
+    std::fs::write(dir.join(".git/config"), config).unwrap();
+}
+
+fn project() -> Proj {
+    let tmp = tempfile::tempdir().unwrap();
+    // Canonical, so paths match what envy prints (`/var` is `/private/var`).
+    let base = tmp.path().canonicalize().unwrap();
+    let home = base.join("home");
+    let user = base.join("userconf");
+    let repo = home.join("work/api");
+    std::fs::create_dir_all(repo.join("src/deep")).unwrap();
+    std::fs::create_dir_all(&user).unwrap();
+    git_repo(&repo, &[("origin", "git@github.com:acme/api.git")]);
+    Proj {
+        _tmp: tmp,
+        home,
+        user,
+        repo,
+    }
+}
+
+impl Proj {
+    fn put_project(&self, ns: &str, text: &str) {
+        std::fs::create_dir_all(self.repo.join(".envy")).unwrap();
+        std::fs::write(self.repo.join(format!(".envy/{ns}.toml")), text).unwrap();
+    }
+
+    fn put_user(&self, ns: &str, text: &str) {
+        std::fs::write(self.user.join(format!("{ns}.toml")), text).unwrap();
+    }
+
+    fn project_cfg(&self) -> Config {
+        Config::project(
+            self.repo.join(".envy"),
+            self.repo.clone(),
+            identity_for_root(&self.repo, &self.home),
+            self.user.clone(),
+        )
+    }
+
+    /// Records the file as it is now as trusted at this checkout.
+    fn trust(&self, ns: &str) {
+        let text = self.project_cfg().load(ns).unwrap().text();
+        TrustStore::new(&self.user)
+            .record(&self.repo, ns, &text)
+            .unwrap();
+    }
+
+    fn trusted(&self, ns: &str) -> bool {
+        let text = self.project_cfg().load(ns).unwrap().text();
+        TrustStore::new(&self.user)
+            .is_trusted(&self.repo, ns, &text)
+            .unwrap()
+    }
+
+    fn env(&self, cmd: &mut Command, cwd: &Path) {
+        cmd.env("PATH", path_with_envy())
+            .env("ENVY_CONFIG_DIR", &self.user)
+            .env("HOME", &self.home)
+            .env_remove("ENVY_ACTIVE")
+            .env_remove("ENVY_VARS")
+            .env_remove("ENVY_EVAL")
+            .current_dir(cwd);
+    }
+
+    /// `script` in zsh with the shell function loaded, run from `cwd`.
+    fn zsh(&self, cwd: &Path, script: &str) -> Output {
+        let mut cmd = Command::new("zsh");
+        cmd.args([
+            "-f",
+            "-c",
+            &format!("eval \"$(envy --init zsh)\"\n{script}"),
+        ]);
+        self.env(&mut cmd, cwd);
+        detached(cmd)
+    }
+
+    /// The binary directly, run from `cwd`.
+    fn envy(&self, cwd: &Path, args: &[&str]) -> Output {
+        let mut cmd = Command::new(ENVY);
+        cmd.args(args);
+        self.env(&mut cmd, cwd);
+        detached(cmd)
+    }
+}
+
+const PROJECT_DEV: &str = "[vars]\nWHERE = \"project\"\nPONLY = \"p\"\n";
+const USER_DEV: &str = "[vars]\nWHERE = \"user\"\n";
+
+#[test]
+fn e2e_a_project_namespace_loads_and_shadows_the_users() {
+    let p = project();
+    p.put_project("dev", PROJECT_DEV);
+    p.trust("dev");
+    let out = p.zsh(
+        &p.repo,
+        "envy dev\nprint -r -- \"$WHERE|$PONLY|$ENVY_ACTIVE\"\n",
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "project|p|dev\n");
+    assert_eq!(stderr(&out), "");
+
+    p.put_user("dev", USER_DEV);
+    let out = p.zsh(
+        &p.repo,
+        r#"envy dev
+print -r -- "$WHERE|$PONLY"
+envy dev --user
+print -r -- "$WHERE|${PONLY-unset}|$ENVY_ACTIVE"
+envy dev
+envy --user dev
+print -r -- "$WHERE|${PONLY-unset}"
+"#,
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "project|p\nuser|unset|dev\nuser|unset\n");
+    // The note for each project load, none for `--user`.
+    assert_eq!(stderr(&out), format!("{SHADOW}{SHADOW}"));
+}
+
+#[test]
+fn e2e_a_subdirectory_finds_the_parent_project() {
+    let p = project();
+    p.put_project("dev", PROJECT_DEV);
+    p.trust("dev");
+    let out = p.zsh(
+        &p.repo.join("src/deep"),
+        "envy dev\nprint -r -- \"$WHERE|$ENVY_ACTIVE\"\n",
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "project|dev\n");
+}
+
+fn mode(path: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path).unwrap().permissions().mode() & 0o7777
+}
+
+#[test]
+fn e2e_new_goes_to_the_user_level_or_the_project() {
+    let p = project();
+    // No `.envy` anywhere: the user level.
+    let out = p.envy(&p.repo.join("src"), &["dev", "--new"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "");
+    assert!(p.user.join("dev.toml").is_file());
+    assert!(!p.repo.join(".envy").exists());
+    assert!(!p.repo.join("src/.envy").exists());
+
+    // `--project` from a subdirectory: at the repository root.
+    let out = p.envy(&p.repo.join("src/deep"), &["dev", "--new", "--project"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "");
+    let file = p.repo.join(".envy/dev.toml");
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "");
+    assert!(!p.repo.join("src/deep/.envy").exists());
+    // Shared, not private: at least rw for the owner, nothing beyond 0644.
+    let m = mode(&file);
+    assert!(m & 0o600 == 0o600 && m & !0o644 == 0, "{m:o}");
+    let m = mode(&p.repo.join(".envy"));
+    assert!(m & 0o700 == 0o700 && m & !0o755 == 0, "{m:o}");
+    let err = stderr(&out);
+    assert!(err.contains("created") && err.contains("\"dev\""), "{err}");
+    // Its trust was recorded: it loads with no confirmation.
+    assert!(p.trusted("dev"));
+    let out = p.zsh(
+        &p.repo.join("src"),
+        "envy dev\nprint -r -- \"$ENVY_ACTIVE\"\n",
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "dev\n");
+    assert_eq!(stderr(&out), SHADOW);
+
+    // Now that `.envy` exists, a plain `--new` goes there; `--user` does not.
+    let out = p.envy(&p.repo, &["web", "--new"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(p.repo.join(".envy/web.toml").is_file());
+    assert!(!p.user.join("web.toml").exists());
+    let out = p.envy(&p.repo, &["mine", "--new", "--user"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(p.user.join("mine.toml").is_file());
+    assert!(!p.repo.join(".envy/mine.toml").exists());
+}
+
+#[test]
+fn e2e_new_project_in_the_home_directory_is_refused() {
+    let p = project();
+    let out = p.envy(&p.home, &["dev", "--new", "--project"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(stdout(&out), "");
+    assert!(stderr(&out).contains("home directory"), "{}", stderr(&out));
+    assert!(!p.home.join(".envy").exists());
+    assert!(!p.user.join("dev.toml").exists());
+}
+
+#[test]
+fn e2e_an_untrusted_project_namespace_needs_a_terminal() {
+    let p = project();
+    p.put_project("dev", PROJECT_DEV);
+    p.put_user("dev", USER_DEV);
+    let out = p.zsh(
+        &p.repo,
+        "envy dev || print -r -- \"failed:$?\"\nprint -r -- \"${WHERE-unset}|${ENVY_ACTIVE-unset}\"\n",
+    );
+    assert_eq!(stdout(&out), "failed:1\nunset|unset\n");
+    let err = stderr(&out);
+    assert!(err.contains("needs a terminal to review"), "{err}");
+    assert!(!err.contains("\"project\""), "{err}");
+    // The binary itself: exit 1 and nothing at all on stdout.
+    let mut cmd = Command::new(ENVY);
+    cmd.arg("dev");
+    p.env(&mut cmd, &p.repo);
+    cmd.env("ENVY_EVAL", "1");
+    let out = detached(cmd);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(stdout(&out), "");
+    assert!(
+        stderr(&out).contains("needs a terminal to review"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(!p.trusted("dev"));
+    // A changed file is untrusted again.
+    p.trust("dev");
+    p.put_project("dev", "[vars]\nWHERE = \"changed\"\n");
+    let out = p.zsh(&p.repo, "envy dev\nprint -r -- \"${WHERE-unset}\"\n");
+    assert_eq!(stdout(&out), "unset\n");
+    assert!(
+        stderr(&out).contains("needs a terminal"),
+        "{}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn e2e_a_corrupt_project_file_fails_closed() {
+    let p = project();
+    p.put_project("dev", "this is [not toml");
+    p.put_user("dev", USER_DEV);
+    let out = p.zsh(
+        &p.repo,
+        "envy dev || print -r -- \"failed:$?\"\nprint -r -- \"${WHERE-unset}|${ENVY_ACTIVE-unset}\"\n",
+    );
+    assert_eq!(stdout(&out), "failed:1\nunset|unset\n");
+    let err = stderr(&out);
+    let file = p.repo.join(".envy/dev.toml").display().to_string();
+    assert!(err.contains(&file) && err.contains("invalid TOML"), "{err}");
+    // `--user` still reaches the user's own.
+    let out = p.zsh(&p.repo, "envy dev --user\nprint -r -- \"$WHERE\"\n");
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "user\n");
+}
+
+#[test]
+fn e2e_listing_shows_both_levels_and_the_source() {
+    let p = project();
+    p.put_project("dev", PROJECT_DEV);
+    p.put_project("ci", "");
+    p.put_user("dev", USER_DEV);
+    p.put_user("mine", "");
+    p.trust("dev");
+    let envy_dir = encode_path(&p.repo.join(".envy"));
+    let listing = |dev: &str| {
+        format!("project: {envy_dir}\n  ci\n{dev} dev\nuser:\n  dev (shadowed)\n  mine\n")
+    };
+    let out = p.envy(&p.repo, &["--list"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stdout(&out), listing(" "));
+    assert_eq!(stderr(&out), "");
+
+    let out = p.envy(&p.repo, &["dev", "--list"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(
+        stdout(&out),
+        format!(
+            "namespace: dev\nsource: project ({envy_dir}/dev.toml)\n\nWHERE  \"project\"\nPONLY  \"p\"\n"
+        )
+    );
+    assert_eq!(stderr(&out), SHADOW);
+    let out = p.envy(&p.repo, &["dev", "--list", "--user"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(
+        stdout(&out),
+        "namespace: dev\nsource: user\n\nWHERE  \"user\"\n"
+    );
+    assert_eq!(stderr(&out), "");
+
+    // Through the shell function, with the project's `dev` active.
+    let out = p.zsh(&p.repo, "envy dev\nenvy\n");
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stdout(&out), listing("*"));
+
+    // Outside the project only the user level shows, as before.
+    let out = p.envy(&p.home, &["--list"]);
+    assert_eq!(stdout(&out), "  dev\n  mine\n");
+}
+
+#[test]
+fn e2e_new_like_an_unknown_namespace_creates_nothing() {
+    let p = project();
+    p.put_project("dev", PROJECT_DEV);
+    for (cwd, extra) in [
+        (&p.repo, &[][..]),
+        (&p.repo, &["--user"][..]),
+        (&p.home, &[][..]),
+    ] {
+        let mut args = vec!["fresh", "--new", "--like", "bogus"];
+        args.extend_from_slice(extra);
+        let out = p.envy(cwd, &args);
+        assert_eq!(out.status.code(), Some(1), "{args:?}");
+        assert_eq!(stdout(&out), "", "{args:?}");
+        let err = stderr(&out);
+        assert!(err.contains("\"bogus\""), "{args:?}: {err}");
+        assert!(!p.repo.join(".envy/fresh.toml").exists(), "{args:?}");
+        assert!(!p.user.join("fresh.toml").exists(), "{args:?}");
+    }
+    // `--user` applies to the source too: a project-only name is not found,
+    // and the error says why.
+    let out = p.envy(&p.repo, &["fresh", "--new", "--like", "dev", "--user"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(stdout(&out), "");
+    let err = stderr(&out);
+    assert!(
+        err.contains("\"dev\"") && err.contains("--user also applies to the --like source"),
+        "{err}"
+    );
+    assert!(!p.user.join("fresh.toml").exists());
+    // Without `--user`, no such hint.
+    let out = p.envy(&p.home, &["fresh", "--new", "--like", "dev"]);
+    assert!(
+        !stderr(&out).contains("--user also applies"),
+        "{}",
+        stderr(&out)
+    );
+    // `--like` resolves the source with the same rule: the project's `dev`.
+    p.trust("dev");
+    let out = p.envy(&p.repo, &["copy", "--new", "--like", "dev"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(
+        std::fs::read_to_string(p.repo.join(".envy/copy.toml")).unwrap(),
+        PROJECT_DEV
+    );
+}
+
+#[test]
+fn e2e_rm_on_a_project_namespace_needs_a_terminal_to_confirm() {
+    let p = project();
+    p.put_project("dev", PROJECT_DEV);
+    let out = p.envy(&p.repo, &["dev", "--rm"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(stdout(&out), "");
+    let err = stderr(&out);
+    assert!(
+        err.contains("terminal") && err.contains("nothing was changed"),
+        "{err}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(p.repo.join(".envy/dev.toml")).unwrap(),
+        PROJECT_DEV
+    );
+}
+
+#[test]
+fn e2e_the_listing_stars_the_level_that_was_loaded() {
+    let p = project();
+    p.put_project("dev", PROJECT_DEV);
+    p.put_user("dev", USER_DEV);
+    p.trust("dev");
+    let label = encode_path(&p.repo.join(".envy"));
+    let out = p.zsh(
+        &p.repo,
+        &format!(
+            r#"envy dev --user
+print -r -- "[$ENVY_SOURCE]"
+envy
+cd {home}
+envy
+cd {repo}
+envy dev
+print -r -- "[$ENVY_SOURCE]"
+envy
+cd {home}
+envy
+envy --off
+print -r -- "[${{ENVY_SOURCE-unset}}]"
+"#,
+            home = sh_quote(&p.home.display().to_string()),
+            repo = sh_quote(&p.repo.display().to_string()),
+        ),
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(
+        stdout(&out),
+        format!(
+            "[user]\n\
+             project: {label}\n  dev\nuser:\n* dev (shadowed)\n\
+             * dev\n\
+             [{label}]\n\
+             project: {label}\n* dev\nuser:\n  dev (shadowed)\n\
+             \x20 dev\n* dev (from another folder)\n\
+             [unset]\n"
+        )
+    );
+}
+
+#[test]
+fn e2e_new_project_above_home_is_refused() {
+    let p = project();
+    let above = p.home.parent().unwrap().to_path_buf();
+    for cwd in [&above, &p.home] {
+        let out = p.envy(cwd, &["x", "--new", "--project"]);
+        assert_eq!(out.status.code(), Some(1), "{}", cwd.display());
+        assert_eq!(stdout(&out), "");
+        assert!(stderr(&out).contains("home directory"), "{}", stderr(&out));
+    }
+    assert!(!above.join(".envy").exists());
+    assert!(!p.home.join(".envy").exists());
+    assert!(!p.user.join("x.toml").exists());
+}
+
+/// In a repository whose `dev` shadows the user's, every changing command
+/// with `--user` changes the user's file and leaves the project's alone.
+#[test]
+fn e2e_user_flag_reaches_the_users_namespace_in_every_command() {
+    let p = project();
+    p.put_project("dev", PROJECT_DEV);
+    p.put_user("dev", USER_DEV);
+    let project_file = p.repo.join(".envy/dev.toml");
+    let user_file = p.user.join("dev.toml");
+    let read = |path: &Path| std::fs::read_to_string(path).unwrap();
+    let project_unchanged = || assert_eq!(read(&project_file), PROJECT_DEV);
+
+    let out = p.envy(&p.repo, &["dev", "--plain", "X=1", "--user"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stderr(&out), "saved X in \"dev\"\n");
+    let user_text = format!("{USER_DEV}X = \"1\"\n");
+    assert_eq!(read(&user_file), user_text);
+    project_unchanged();
+
+    let out = p.envy(&p.repo, &["dev", "--link", "g", "--user"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(read(&user_file), format!("link = \"g\"\n{user_text}"));
+    project_unchanged();
+    let out = p.envy(&p.repo, &["dev", "--unlink", "--user"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(read(&user_file), user_text);
+    project_unchanged();
+
+    let (_ed, script) = editor_script("printf 'NEW = \"added\"\\n' >> \"$1\"");
+    let mut cmd = Command::new(ENVY);
+    cmd.args(["dev", "--edit", "--user"]).env("VISUAL", &script);
+    p.env(&mut cmd, &p.repo);
+    let out = detached(cmd);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let user_text = format!("{user_text}NEW = \"added\"\n");
+    assert_eq!(read(&user_file), user_text);
+    project_unchanged();
+
+    // `--like` with `--user` copies the user's `dev`, into the user level.
+    let out = p.envy(&p.repo, &["copy", "--new", "--like", "dev", "--user"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(read(&p.user.join("copy.toml")), user_text);
+    assert!(!p.repo.join(".envy/copy.toml").exists());
+    // Without it, the project's `dev`, into the project.
+    p.trust("dev");
+    let out = p.envy(&p.repo, &["copy2", "--new", "--like", "dev"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(read(&p.repo.join(".envy/copy2.toml")), PROJECT_DEV);
+    assert!(!p.user.join("copy2.toml").exists());
+
+    // `--rm --user` asks first, and there is no terminal to ask on. The
+    // question is the user-level one: no project wording, no shadow note.
+    let out = p.envy(&p.repo, &["dev", "--rm", "--user"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(stdout(&out), "");
+    let err = stderr(&out);
+    assert!(
+        err.starts_with("error: ") && err.contains("terminal"),
+        "{err}"
+    );
+    assert!(!err.contains("project") && !err.contains("note:"), "{err}");
+    // Without `--user`, the project's: the note and the project question.
+    let out = p.envy(&p.repo, &["dev", "--rm"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(stdout(&out), "");
+    let err = stderr(&out);
+    assert!(
+        err.starts_with(SHADOW) && err.contains("deleting project namespace \"dev\""),
+        "{err}"
+    );
+    assert_eq!(read(&user_file), user_text);
+    project_unchanged();
+}
+
+#[test]
+fn e2e_a_deleted_current_directory_says_what_to_do() {
+    let p = project();
+    let gone = p.home.join("gone");
+    std::fs::create_dir_all(&gone).unwrap();
+    let out = p.zsh(
+        &gone,
+        &format!(
+            "rmdir {}\nenvy --list",
+            sh_quote(&gone.display().to_string())
+        ),
+    );
+    assert_eq!(stdout(&out), "");
+    let err = stderr(&out);
+    assert!(err.contains("cd to an existing folder"), "{err}");
+}
+
+#[test]
+fn e2e_forks_share_the_upstream_identity_and_dotfiles_do_not_leak() {
+    let p = project();
+    let fork = p.home.join("forks/api");
+    let other = p.home.join("other/api");
+    git_repo(
+        &fork,
+        &[
+            ("origin", "git@github.com:me/api.git"),
+            ("upstream", "https://github.com/acme/api.git"),
+        ],
+    );
+    git_repo(
+        &other,
+        &[
+            ("origin", "ssh://git@gitlab.example.com/someone/else.git"),
+            ("upstream", "git@github.com:Acme/API.git"),
+        ],
+    );
+    let id = identity_for_root(&p.repo, &p.home);
+    assert_eq!(id, "acme/api");
+    assert_eq!(identity_for_root(&fork, &p.home), id);
+    assert_eq!(identity_for_root(&other, &p.home), id);
+
+    // A dotfiles repository at home lends nothing to a folder under it.
+    git_repo(&p.home, &[("origin", "git@github.com:me/dotfiles.git")]);
+    let loose = p.home.join("loose");
+    std::fs::create_dir_all(loose.join("sub")).unwrap();
+    assert_eq!(identity_for_root(&loose, &p.home), "~/loose");
+    let out = p.envy(&loose.join("sub"), &["dev", "--new", "--project"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(loose.join("sub/.envy/dev.toml").is_file());
+    assert!(!p.home.join(".envy").exists());
+}
+
+#[test]
+fn a_file_setting_envys_own_variables_is_refused() {
+    let dir = fixture();
+    std::fs::write(
+        dir.path().join("evil.toml"),
+        "[vars]\nFIRST = \"1\"\nENVY_CONFIG_DIR = \"/tmp/zq-elsewhere\"\nENVY_EVAL = \"1\"\n",
+    )
+    .unwrap();
+    let out = zsh(
+        dir.path(),
+        r#"envy evil || print -r -- "failed:$?"
+print -r -- "${FIRST-unset}|${ENVY_EVAL-unset}|${ENVY_ACTIVE-unset}|$ENVY_CONFIG_DIR"
+"#,
+    );
+    assert_eq!(
+        stdout(&out),
+        format!("failed:1\nunset|unset|unset|{}\n", dir.path().display())
+    );
+    let err = stderr(&out);
+    assert!(
+        err.contains("\"ENVY_CONFIG_DIR\"") && err.contains("ENVY_ prefix"),
+        "{err}"
+    );
+    assert!(!err.contains("zq-elsewhere"), "{err}");
+}
+
+#[test]
+fn e2e_a_fifo_named_like_a_namespace_fails_promptly() {
+    let p = project();
+    std::fs::create_dir_all(p.repo.join(".envy")).unwrap();
+    let fifo = p.repo.join(".envy/fifo.toml");
+    let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+    // SAFETY: a valid NUL-terminated path.
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
+    // `detached` kills it (and fails) after 10 seconds.
+    for args in [&["fifo", "--list"][..], &["--list"]] {
+        let out = p.envy(&p.repo, args);
+        if args.len() == 2 {
+            assert_eq!(out.status.code(), Some(1));
+            assert_eq!(stdout(&out), "");
+            assert!(
+                stderr(&out).contains("not a regular file"),
+                "{}",
+                stderr(&out)
+            );
+        } else {
+            assert!(out.status.success(), "{}", stderr(&out));
+        }
+    }
+    let out = p.zsh(&p.repo, "envy fifo || print -r -- failed\n");
+    assert_eq!(stdout(&out), "failed\n");
+}
+
+#[test]
+fn e2e_a_symlinked_envy_is_ignored_with_a_note() {
+    let p = project();
+    let elsewhere = p.home.join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    std::fs::write(elsewhere.join("dev.toml"), PROJECT_DEV).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, p.repo.join(".envy")).unwrap();
+    p.put_user("dev", USER_DEV);
+    let note = format!(
+        "note: ignoring {}: it is a symlink\n",
+        encode_path(&p.repo.join(".envy"))
+    );
+    let out = p.envy(&p.repo, &["--list"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "  dev\n");
+    assert_eq!(stderr(&out), note);
+    let out = p.zsh(&p.repo, "envy dev\nprint -r -- \"$WHERE\"\n");
+    assert_eq!(stdout(&out), "user\n");
+    assert_eq!(stderr(&out), note);
+}
+
+#[test]
+fn e2e_a_user_config_dir_named_envy_is_still_the_user_level() {
+    let p = project();
+    let dots = p.home.join("dots");
+    let conf = dots.join(".envy");
+    std::fs::create_dir_all(&conf).unwrap();
+    std::fs::write(conf.join("dev.toml"), USER_DEV).unwrap();
+    let script = format!(
+        "export ENVY_CONFIG_DIR={}\nenvy dev\nprint -r -- \"$WHERE|$ENVY_SOURCE\"\nenvy\n",
+        sh_quote(&conf.display().to_string())
+    );
+    let out = p.zsh(&dots, &script);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "user|user\n* dev\n");
+    assert_eq!(stderr(&out), "");
 }

@@ -1,6 +1,10 @@
 use anyhow::{Result, bail};
 
-const RESERVED_VARS: [&str; 2] = ["ENVY_ACTIVE", "ENVY_VARS"];
+/// Every variable name starting with this is refused: envy's own settings
+/// (`ENVY_CONFIG_DIR`, `ENVY_EVAL`) and shell state (`ENVY_ACTIVE`,
+/// `ENVY_VARS`, `ENVY_SOURCE`) use it, and a namespace file that set one
+/// could redirect envy's config and trust store or switch off its guards.
+const RESERVED_PREFIX: &str = "ENVY_";
 
 /// zsh's special parameters. Activation runs `export NAME='value'` in the
 /// user's shell, and for these that is not a plain assignment: integer
@@ -165,7 +169,7 @@ pub fn validate_namespace(name: &str) -> Result<()> {
 }
 
 /// Validates an environment variable name: a shell identifier
-/// `[A-Za-z_][A-Za-z0-9_]*` that is not one of envy's reserved variables, a
+/// `[A-Za-z_][A-Za-z0-9_]*` that does not start with `ENVY_` (envy's own), a
 /// zsh special parameter, `SHELL`/`USER`, or a dynamic loader variable.
 /// Errors name the variable and the reason, never a value.
 pub fn validate_var(name: &str) -> Result<()> {
@@ -175,8 +179,10 @@ pub fn validate_var(name: &str) -> Result<()> {
     if !valid {
         bail!("invalid variable name {name:?}: must match [A-Za-z_][A-Za-z0-9_]*");
     }
-    if RESERVED_VARS.contains(&name) {
-        bail!("variable name {name:?} is reserved by envy");
+    if name.starts_with(RESERVED_PREFIX) {
+        bail!(
+            "variable name {name:?} is reserved by envy: the ENVY_ prefix is reserved for envy's own settings"
+        );
     }
     if ZSH_SPECIALS.contains(&name) {
         bail!(
@@ -318,8 +324,32 @@ mod tests {
 
     #[test]
     fn var_rejects_invalid() {
-        for n in ["1A", "A-B", "", "ENVY_ACTIVE", "ENVY_VARS"] {
+        for n in ["1A", "A-B", "", "ENVY_ACTIVE", "ENVY_VARS", "ENVY_SOURCE"] {
             assert!(validate_var(n).is_err(), "{n:?}");
+        }
+    }
+
+    #[test]
+    fn the_envy_prefix_is_reserved() {
+        for n in [
+            "ENVY_CONFIG_DIR",
+            "ENVY_EVAL",
+            "ENVY_ACTIVE",
+            "ENVY_VARS",
+            "ENVY_SOURCE",
+            "ENVY_X",
+            "ENVY_",
+        ] {
+            let err = validate_var(n).unwrap_err().to_string();
+            assert_eq!(
+                err,
+                format!(
+                    "variable name {n:?} is reserved by envy: the ENVY_ prefix is reserved for envy's own settings"
+                )
+            );
+        }
+        for ok in ["envy_x", "Envy_X", "ENVYX", "MY_ENVY_X"] {
+            assert!(validate_var(ok).is_ok(), "{ok}");
         }
     }
 }
