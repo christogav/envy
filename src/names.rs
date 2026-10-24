@@ -40,6 +40,12 @@ const ZSH_SPECIALS: &[&str] = &[
     "IFS",
     "KEYBOARD_HACK",
     "LANG",
+    "LC_ALL",
+    "LC_COLLATE",
+    "LC_CTYPE",
+    "LC_MESSAGES",
+    "LC_NUMERIC",
+    "LC_TIME",
     "LINENO",
     "LINES",
     "MAILPATH",
@@ -302,9 +308,24 @@ mod tests {
 
     /// Every special parameter the zsh on this machine knows (with the
     /// modules an interactive shell commonly loads) must be refused.
+    /// zsh makes the locale variables special only when they are in its
+    /// environment, so the test puts them there rather than depend on the
+    /// machine it runs on.
     #[test]
     fn var_rejects_every_special_parameter_of_the_local_zsh() {
-        let out = std::process::Command::new("zsh")
+        let mut zsh = std::process::Command::new("zsh");
+        for n in [
+            "LANG",
+            "LC_ALL",
+            "LC_COLLATE",
+            "LC_CTYPE",
+            "LC_MESSAGES",
+            "LC_NUMERIC",
+            "LC_TIME",
+        ] {
+            zsh.env(n, "C");
+        }
+        let out = zsh
             .args([
                 "-fc",
                 "zmodload zsh/parameter zsh/datetime zsh/system zsh/terminfo zsh/termcap \
