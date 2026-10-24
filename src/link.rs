@@ -1609,7 +1609,13 @@ mod tests {
 
         // A new label creates the group from what --like copied.
         let prompt = ScriptedPrompter::new().with_secret("tm");
-        create(&ctx(&cfg, &store, &prompt), "m", Some("a"), Some("gcp")).unwrap();
+        create(
+            &ctx(&cfg, &store, &prompt),
+            "m",
+            Some(&cfg.load("a").unwrap()),
+            Some("gcp"),
+        )
+        .unwrap();
         assert_eq!(
             read(&dir, "m"),
             "link = \"gcp\"\n\n[vars]\nREGION = \"eu\"\nTOKEN = \"@keychain\"\n"
@@ -1626,9 +1632,14 @@ mod tests {
 
         // --like copies a name the group does not have: refused before any prompt.
         let prompt = ScriptedPrompter::new().with_secret("t").with_secret("e");
-        let err = create(&ctx(&cfg, &store, &prompt), "n", Some("src"), Some("aws"))
-            .unwrap_err()
-            .to_string();
+        let err = create(
+            &ctx(&cfg, &store, &prompt),
+            "n",
+            Some(&cfg.load("src").unwrap()),
+            Some("aws"),
+        )
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("EXTRA"), "{err}");
         assert!(prompt.asked().is_empty());
         assert_eq!((texts(&dir), store.snapshot()), before);

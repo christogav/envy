@@ -81,7 +81,8 @@ fn run(action: Action) -> Result<String> {
                 store: &MacKeychain,
                 prompt: &TtyPrompter,
             };
-            commands::create(&ctx, &ns, like.as_deref(), link.as_deref())?;
+            let source = like.map(|n| cfg.load(&n)).transpose()?;
+            commands::create(&ctx, &ns, source.as_ref(), link.as_deref())?;
             eprintln!("created namespace {ns:?}");
             Ok(String::new())
         }

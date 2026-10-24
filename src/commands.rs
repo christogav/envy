@@ -63,8 +63,9 @@ pub fn activate(ctx: &Ctx, ns: &str, prev: &ActiveState) -> Result<String> {
         return Err(rollback(ctx, &key, undo, e));
     }
     // `render_activate` fetches every secret before building any output, so
-    // a failure here prints nothing. The secrets just saved stay saved: the
-    // user entered them for this namespace and confirmed it.
+    // a failure here prints nothing. The new secrets and the trust record
+    // both stay: the user entered and confirmed them, and a render failure
+    // does not roll either back.
     render_activate(&file, prev, ctx.store)
 }
 
@@ -408,20 +409,21 @@ fn restore_files(
     }
 }
 
-/// Creates namespace `ns`, empty or modelled on `like` (names and plain values
-/// are copied; each secret is prompted for; the `link` label is not copied),
-/// and with `link` joins it to that link group.
+/// Creates namespace `ns` in `ctx.cfg`'s level, empty or modelled on `like`
+/// (an already-resolved source file, possibly from another level: names and
+/// plain values are copied; each secret is prompted for under the new
+/// namespace's key; the `link` label is not copied), and with `link` joins
+/// it to that link group. A `like` that is the very namespace being created
+/// at this level fails as "already exists". At project level the new file is
+/// recorded as trusted: the user just wrote it.
 ///
 /// Order: validate, check that the namespace can join the group, prompt for
 /// everything, re-check that `ns` still does not exist, then [`apply`]. A
 /// failure at any step leaves nothing behind.
-pub fn create(ctx: &Ctx, ns: &str, like: Option<&str>, link: Option<&str>) -> Result<()> {
+pub fn create(ctx: &Ctx, ns: &str, like: Option<&NamespaceFile>, link: Option<&str>) -> Result<()> {
     validate_namespace(ns)?;
-    for name in [like, link].into_iter().flatten() {
-        validate_namespace(name)?;
-    }
-    if like == Some(ns) {
-        bail!("namespace {ns:?} cannot be created like itself");
+    if let Some(group) = link {
+        validate_namespace(group)?;
     }
     if ctx.cfg.exists(ns)? {
         bail!("namespace {ns:?} already exists");
@@ -429,7 +431,7 @@ pub fn create(ctx: &Ctx, ns: &str, like: Option<&str>, link: Option<&str>) -> Re
     let mut file = NamespaceFile::empty(ns)?;
     let mut like_secrets: Vec<String> = Vec::new();
     if let Some(source) = like {
-        for (name, value) in ctx.cfg.load(source)?.vars() {
+        for (name, value) in source.vars() {
             if value == Value::Secret {
                 like_secrets.push(name.clone());
             }
@@ -467,7 +469,11 @@ pub fn create(ctx: &Ctx, ns: &str, like: Option<&str>, link: Option<&str>) -> Re
             secrets,
             delete: Vec::new(),
         }],
-    )
+    )?;
+    // The user just wrote this file, so it needs no confirmation later. If
+    // recording fails the file already exists; the error is returned and the
+    // file is simply confirmed at its first load. A no-op at user level.
+    record_trust(ctx, &ctx.cfg.load(ns)?)
 }
 
 /// How one variable of `--secret` or `--plain` is set. Never holds a secret
@@ -613,10 +619,18 @@ fn check_inline_plain(name: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
-/// Deletes namespace `ns` after confirmation: its Keychain items first, then
-/// the file. If something fails midway the file is still there, still lists
-/// the secrets, and running the command again finishes the job (deleting an
-/// item that is already gone is fine).
+/// Deletes namespace `ns` after confirmation.
+///
+/// User level: one question naming the secrets; the Keychain items go first,
+/// then the file. Project level: question 1 deletes the file from the working
+/// tree; then, only if the namespace has secrets, question 2 (default no)
+/// asks whether to delete the Keychain items too, which every other checkout
+/// and fork of the project on this machine shares. Both are asked before
+/// anything is written, and a no to question 1 skips question 2. No trust
+/// check: deleting is not loading. The items go before the file, so if
+/// something fails midway the file is still there, still lists the secrets,
+/// and running the command again finishes the job (deleting an item that is
+/// already gone is fine).
 pub fn remove(ctx: &Ctx, ns: &str) -> Result<()> {
     let file = ctx.cfg.load(ns)?;
     let secrets: Vec<String> = file
@@ -624,21 +638,43 @@ pub fn remove(ctx: &Ctx, ns: &str) -> Result<()> {
         .into_iter()
         .filter_map(|(name, value)| (value == Value::Secret).then_some(name))
         .collect();
-    let question = if secrets.is_empty() {
-        format!("Delete namespace {ns:?}?")
+    let mut delete_items = true;
+    if ctx.cfg.is_project() {
+        let q1 = format!(
+            "Delete project namespace {ns:?}? Its file is removed from the working tree \
+             (git status will show it)."
+        );
+        if !ctx.prompt.confirm(&q1)? {
+            bail!("cancelled; nothing was changed");
+        }
+        delete_items = !secrets.is_empty() && {
+            let q2 = format!(
+                "Namespace {ns:?} has {} secret(s) in the Keychain ({}). They are shared with \
+                 every other checkout and fork of this project on this machine. Delete them too?",
+                secrets.len(),
+                secrets.join(", ")
+            );
+            ctx.prompt.confirm(&q2)?
+        };
     } else {
-        format!(
-            "Delete namespace {ns:?} and its {} secret(s) from the Keychain ({})?",
-            secrets.len(),
-            secrets.join(", ")
-        )
-    };
-    if !ctx.prompt.confirm(&question)? {
-        bail!("cancelled; nothing was changed");
+        let question = if secrets.is_empty() {
+            format!("Delete namespace {ns:?}?")
+        } else {
+            format!(
+                "Delete namespace {ns:?} and its {} secret(s) from the Keychain ({})?",
+                secrets.len(),
+                secrets.join(", ")
+            )
+        };
+        if !ctx.prompt.confirm(&question)? {
+            bail!("cancelled; nothing was changed");
+        }
     }
-    let key = ctx.cfg.secret_key(ns);
-    for name in &secrets {
-        ctx.store.delete(&key, name)?;
+    if delete_items {
+        let key = ctx.cfg.secret_key(ns);
+        for name in &secrets {
+            ctx.store.delete(&key, name)?;
+        }
     }
     ctx.cfg.delete(ns)
 }
@@ -1118,7 +1154,7 @@ mod tests {
             store: &store,
             prompt: &prompt,
         };
-        create(&ctx, "dst", Some("src"), None).unwrap();
+        create(&ctx, "dst", Some(&cfg.load("src").unwrap()), None).unwrap();
         assert_eq!(
             read(&dir, "dst"),
             "[vars]\nAWS_REGION = \"eu-west-1\"\nTOKEN = \"@keychain\"\n"
@@ -1149,16 +1185,16 @@ mod tests {
             store: &store,
             prompt: &prompt,
         };
-        let err = create(&ctx, "dst", Some("nope"), None)
-            .unwrap_err()
-            .to_string();
+        // The caller resolves the source; a missing one never reaches create.
+        let err = cfg.load("nope").unwrap_err().to_string();
         assert!(err.contains("nope"), "{err}");
+        let _ = ctx;
         assert!(file_names(&dir).is_empty());
         assert!(snap(&store).is_empty());
     }
 
     #[test]
-    fn like_itself_is_rejected_and_leaves_the_namespace_alone() {
+    fn create_like_self_at_the_same_level_errors_and_creates_nothing() {
         let (dir, cfg) = config_with(&[("w", SOURCE)]);
         let store = MemoryStore::default();
         let prompt = ScriptedPrompter::new();
@@ -1167,10 +1203,15 @@ mod tests {
             store: &store,
             prompt: &prompt,
         };
-        let err = create(&ctx, "w", Some("w"), None).unwrap_err().to_string();
-        assert!(err.contains("itself"), "{err}");
+        let source = cfg.load("w").unwrap();
+        let err = create(&ctx, "w", Some(&source), None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("already exists"), "{err}");
         assert_eq!(read(&dir, "w"), SOURCE);
+        assert_eq!(file_names(&dir), vec!["w.toml"]);
         assert!(snap(&store).is_empty());
+        assert!(prompt.asked().is_empty());
     }
 
     #[test]
@@ -1186,7 +1227,7 @@ mod tests {
             store: &store,
             prompt: &prompt,
         };
-        assert!(create(&ctx, "dst", Some("src"), None).is_err());
+        assert!(create(&ctx, "dst", Some(&cfg.load("src").unwrap()), None).is_err());
         assert_eq!(file_names(&dir), vec!["src.toml"]);
         assert!(snap(&store).is_empty());
     }
@@ -1228,7 +1269,7 @@ mod tests {
             store: &store,
             prompt: &prompt,
         };
-        assert!(create(&ctx, "dst", Some("src"), None).is_err());
+        assert!(create(&ctx, "dst", Some(&cfg.load("src").unwrap()), None).is_err());
         assert_eq!(file_names(&dir), vec!["src.toml"]);
         assert!(snap(&store.inner).is_empty());
     }
@@ -1246,7 +1287,7 @@ mod tests {
             prompt: &prompt,
         };
         // `exists` is false for a directory, so create proceeds to the save.
-        assert!(create(&ctx, "dst", Some("src"), None).is_err());
+        assert!(create(&ctx, "dst", Some(&cfg.load("src").unwrap()), None).is_err());
         assert!(snap(&store).is_empty());
     }
 
@@ -1364,7 +1405,7 @@ mod tests {
             store: &store,
             prompt: &prompt,
         };
-        let err = create(&ctx, "dst", Some("src"), None)
+        let err = create(&ctx, "dst", Some(&cfg.load("src").unwrap()), None)
             .unwrap_err()
             .to_string();
         assert!(err.contains("while envy was prompting"), "{err}");
@@ -2936,8 +2977,10 @@ mod tests {
         assert!(render(&b).ends_with("export TOKEN='vb'\n"));
         assert!(render(&user).ends_with("export TOKEN='vu'\n"));
 
-        // Removing one leaves the others untouched.
-        let yes = ScriptedPrompter::new().with_confirm(true);
+        // Removing one (file and items) leaves the others untouched.
+        let yes = ScriptedPrompter::new()
+            .with_confirm(true)
+            .with_confirm(true);
         remove(
             &Ctx {
                 cfg: &a,
@@ -3558,5 +3601,244 @@ mod tests {
             "{msg}"
         );
         assert!(snap(&store).is_empty());
+    }
+
+    // ---- project-level create and remove ----
+
+    fn ctx_of<'a>(
+        cfg: &'a Config,
+        store: &'a MemoryStore,
+        prompt: &'a ScriptedPrompter,
+    ) -> Ctx<'a> {
+        Ctx { cfg, store, prompt }
+    }
+
+    fn mode(path: &Path) -> u32 {
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o7777
+    }
+
+    #[test]
+    fn create_in_a_project_level_writes_a_shared_file_and_records_trust() {
+        let base = tempfile::tempdir().unwrap();
+        let cfg = project_cfg(base.path(), "acme/api");
+        let store = MemoryStore::default();
+        let prompt = ScriptedPrompter::new();
+        create(&ctx_of(&cfg, &store, &prompt), "dev", None, None).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(base.path().join(".envy/dev.toml")).unwrap(),
+            ""
+        );
+        assert!(store.snapshot().is_empty());
+        assert!(trusted(&cfg, ""));
+        // Loading it needs no confirmation.
+        let quiet = ScriptedPrompter::new();
+        activate(
+            &ctx_of(&cfg, &store, &quiet),
+            "dev",
+            &ActiveState::default(),
+        )
+        .unwrap();
+        assert!(quiet.asked().is_empty());
+    }
+
+    #[test]
+    fn create_into_a_missing_envy_directory_uses_shared_permissions() {
+        let base = tempfile::tempdir().unwrap();
+        let cfg = project_cfg(base.path(), "acme/api");
+        assert!(!base.path().join(".envy").exists());
+        let store = MemoryStore::default();
+        let prompt = ScriptedPrompter::new();
+        create(&ctx_of(&cfg, &store, &prompt), "dev", None, None).unwrap();
+        let dir_mode = mode(&base.path().join(".envy"));
+        assert!(
+            dir_mode & 0o700 == 0o700 && dir_mode & !0o755 == 0,
+            "{dir_mode:o}"
+        );
+        let file_mode = mode(&base.path().join(".envy/dev.toml"));
+        assert!(
+            file_mode & 0o600 == 0o600 && file_mode & !0o644 == 0,
+            "{file_mode:o}"
+        );
+    }
+
+    #[test]
+    fn create_with_like_copies_from_a_resolved_source_in_another_level() {
+        let base = tempfile::tempdir().unwrap();
+        let user = Config::new(base.path().join("user-ns"));
+        std::fs::create_dir_all(user.dir()).unwrap();
+        std::fs::write(user.dir().join("dev.toml"), SOURCE).unwrap();
+        let cfg = project_cfg(base.path(), "acme/api");
+        let store = MemoryStore::default();
+        store
+            .set("dev", "TOKEN", &Secret::new("user-token".into()))
+            .unwrap();
+        let prompt = ScriptedPrompter::new().with_secret("proj-token");
+        let source = user.load("dev").unwrap();
+        create(&ctx_of(&cfg, &store, &prompt), "dev", Some(&source), None).unwrap();
+        let text = std::fs::read_to_string(base.path().join(".envy/dev.toml")).unwrap();
+        assert_eq!(
+            text,
+            "[vars]\nAWS_REGION = \"eu-west-1\"\nTOKEN = \"@keychain\"\n"
+        );
+        assert_eq!(
+            store.snapshot(),
+            vec![
+                entry("dev", "TOKEN", "user-token"),
+                entry(PKEY, "TOKEN", "proj-token")
+            ]
+        );
+        assert_eq!(
+            std::fs::read_to_string(user.dir().join("dev.toml")).unwrap(),
+            SOURCE
+        );
+        assert_eq!(
+            prompt.asked(),
+            vec![Asked::Secret(secret_label("TOKEN", "dev"))]
+        );
+        assert!(trusted(&cfg, &text));
+    }
+
+    const RM: &str = "[vars]\nREGION = \"eu\"\nTOKEN = \"@keychain\"\nAPI_KEY = \"@keychain\"\n";
+
+    fn rm_store() -> MemoryStore {
+        let store = MemoryStore::default();
+        for (ns, name, v) in [
+            (PKEY, "TOKEN", "t"),
+            (PKEY, "API_KEY", "k"),
+            ("project/other/repo/dev", "TOKEN", "o"),
+            ("dev", "TOKEN", "u"),
+        ] {
+            store.set(ns, name, &Secret::new(v.into())).unwrap();
+        }
+        store
+    }
+
+    #[test]
+    fn remove_project_namespace_keeps_shared_secrets_by_default() {
+        let base = tempfile::tempdir().unwrap();
+        let cfg = checkout(base.path(), "a", RM);
+        let store = rm_store();
+        let before = store.snapshot();
+        let prompt = ScriptedPrompter::new()
+            .with_confirm(true)
+            .with_confirm(false);
+        remove(&ctx_of(&cfg, &store, &prompt), "dev").unwrap();
+        assert!(!cfg.exists("dev").unwrap());
+        assert_eq!(store.snapshot(), before);
+        assert_eq!(prompt.asked().len(), 2);
+        assert_eq!(prompt.remaining(), 0);
+    }
+
+    #[test]
+    fn remove_project_namespace_can_delete_the_projects_items() {
+        let base = tempfile::tempdir().unwrap();
+        let cfg = checkout(base.path(), "a", RM);
+        let store = rm_store();
+        let prompt = ScriptedPrompter::new()
+            .with_confirm(true)
+            .with_confirm(true);
+        remove(&ctx_of(&cfg, &store, &prompt), "dev").unwrap();
+        assert!(!cfg.exists("dev").unwrap());
+        assert_eq!(
+            store.snapshot(),
+            vec![
+                entry("dev", "TOKEN", "u"),
+                entry("project/other/repo/dev", "TOKEN", "o"),
+            ]
+        );
+    }
+
+    #[test]
+    fn remove_project_declined_changes_nothing() {
+        let base = tempfile::tempdir().unwrap();
+        let cfg = checkout(base.path(), "a", RM);
+        let store = rm_store();
+        let before = store.snapshot();
+        let prompt = ScriptedPrompter::new()
+            .with_confirm(false)
+            .with_confirm(true);
+        assert!(remove(&ctx_of(&cfg, &store, &prompt), "dev").is_err());
+        assert_eq!(
+            std::fs::read_to_string(base.path().join("a/.envy/dev.toml")).unwrap(),
+            RM
+        );
+        assert_eq!(store.snapshot(), before);
+        assert_eq!(prompt.asked().len(), 1);
+    }
+
+    #[test]
+    fn remove_project_namespace_without_secrets_asks_one_question() {
+        let base = tempfile::tempdir().unwrap();
+        let cfg = checkout(base.path(), "a", "[vars]\nREGION = \"eu\"\n");
+        let store = rm_store();
+        let before = store.snapshot();
+        let prompt = ScriptedPrompter::new().with_confirm(true);
+        remove(&ctx_of(&cfg, &store, &prompt), "dev").unwrap();
+        assert!(!cfg.exists("dev").unwrap());
+        assert_eq!(store.snapshot(), before);
+        assert_eq!(prompt.asked().len(), 1);
+    }
+
+    #[test]
+    fn remove_user_namespace_is_unchanged() {
+        let (dir, cfg) = config_with(&[("dev", RM)]);
+        let store = rm_store();
+        let prompt = ScriptedPrompter::new().with_confirm(true);
+        remove(&ctx_of(&cfg, &store, &prompt), "dev").unwrap();
+        assert!(file_names(&dir).is_empty());
+        assert_eq!(
+            store.snapshot(),
+            vec![
+                entry(PKEY, "API_KEY", "k"),
+                entry(PKEY, "TOKEN", "t"),
+                entry("project/other/repo/dev", "TOKEN", "o"),
+            ]
+        );
+        let asked = prompt.asked();
+        assert_eq!(asked.len(), 1);
+        assert!(matches!(&asked[0], Asked::Confirm(t) if t.contains("TOKEN, API_KEY")));
+    }
+
+    #[test]
+    fn remove_project_namespace_needs_no_trust() {
+        let base = tempfile::tempdir().unwrap();
+        let cfg = checkout(base.path(), "a", RM);
+        assert!(!trusted(&cfg, RM));
+        let store = rm_store();
+        let prompt = ScriptedPrompter::new()
+            .with_confirm(true)
+            .with_confirm(false);
+        remove(&ctx_of(&cfg, &store, &prompt), "dev").unwrap();
+        assert!(!cfg.exists("dev").unwrap());
+        for a in prompt.asked() {
+            let Asked::Confirm(t) = a else { panic!() };
+            assert!(!t.contains("trust"), "{t}");
+        }
+    }
+
+    #[test]
+    fn remove_texts_name_secrets_and_mention_sharing() {
+        let base = tempfile::tempdir().unwrap();
+        let cfg = checkout(base.path(), "a", RM);
+        let store = rm_store();
+        let prompt = ScriptedPrompter::new()
+            .with_confirm(true)
+            .with_confirm(false);
+        remove(&ctx_of(&cfg, &store, &prompt), "dev").unwrap();
+        let asked = prompt.asked();
+        let (Asked::Confirm(q1), Asked::Confirm(q2)) = (&asked[0], &asked[1]) else {
+            panic!()
+        };
+        assert!(q1.contains("\"dev\""), "{q1}");
+        assert!(q2.contains("TOKEN") && q2.contains("API_KEY"), "{q2}");
+        assert!(
+            q2.contains("shared") && q2.contains("checkout") && q2.contains("fork"),
+            "{q2}"
+        );
+        for q in [q1, q2] {
+            for v in ["\"eu\"", "t'", "\"k\""] {
+                assert!(!q.contains(v), "{q}");
+            }
+        }
     }
 }
