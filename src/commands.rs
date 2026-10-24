@@ -5055,4 +5055,48 @@ mod tests {
         .unwrap();
         assert_eq!(p.asked(), vec![Asked::Secret(secret_label("MORE", shown))]);
     }
+
+    // ---- final fix wave ----
+
+    #[test]
+    fn envy_prefixed_names_are_refused_at_every_entry_point() {
+        let before = "[vars]\nA = \"1\"\n";
+        let (dir, cfg) = config_with(&[("work", before)]);
+        let store = MemoryStore::default();
+        let prompt = ScriptedPrompter::new();
+        let ctx = ctx_of(&cfg, &store, &prompt);
+        let prefix = |e: anyhow::Error| {
+            let m = format!("{e:#}");
+            assert!(m.contains("ENVY_ prefix"), "{m}");
+        };
+        for name in ["ENVY_CONFIG_DIR", "ENVY_EVAL", "ENVY_ACTIVE", "ENVY_X"] {
+            // --plain / --secret
+            prefix(set_vars(&ctx, "work", &[pv(name, "/x")]).unwrap_err());
+            prefix(set_vars(&ctx, "work", &[sec(name)]).unwrap_err());
+            // --edit
+            let text = format!("[vars]\nA = \"1\"\n{name} = \"1\"\n");
+            let seen = RefCell::new(Seen::default());
+            prefix(edit(&ctx, "work", &editor(&seen, |_| text.clone())).unwrap_err());
+            assert_eq!(read(&dir, "work"), before);
+            // An existing file: loading it (activation, --like source) fails.
+            std::fs::write(dir.path().join("evil.toml"), &text).unwrap();
+            prefix(cfg.load("evil").unwrap_err());
+            prefix(activate(&ctx, "evil", &ActiveState::default()).unwrap_err());
+            // A link-group member with such a name stops the propagation.
+            std::fs::write(
+                dir.path().join("evil.toml"),
+                format!("link = \"g\"\n{text}"),
+            )
+            .unwrap();
+            prefix(link::link(&ctx, "work", "g").unwrap_err());
+            assert_eq!(read(&dir, "work"), before);
+            std::fs::remove_file(dir.path().join("evil.toml")).unwrap();
+        }
+        assert!(prompt.asked().is_empty());
+        assert!(snap(&store).is_empty());
+        // Lowercase is not the reserved prefix.
+        set_vars(&ctx, "work", &[pv("envy_x", "1")]).unwrap();
+        let out = activate(&ctx, "work", &ActiveState::default()).unwrap();
+        assert!(out.ends_with("export envy_x='1'\n"), "{out}");
+    }
 }

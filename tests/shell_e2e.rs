@@ -1459,3 +1459,29 @@ fn e2e_forks_share_the_upstream_identity_and_dotfiles_do_not_leak() {
     assert!(loose.join("sub/.envy/dev.toml").is_file());
     assert!(!p.home.join(".envy").exists());
 }
+
+#[test]
+fn a_file_setting_envys_own_variables_is_refused() {
+    let dir = fixture();
+    std::fs::write(
+        dir.path().join("evil.toml"),
+        "[vars]\nFIRST = \"1\"\nENVY_CONFIG_DIR = \"/tmp/zq-elsewhere\"\nENVY_EVAL = \"1\"\n",
+    )
+    .unwrap();
+    let out = zsh(
+        dir.path(),
+        r#"envy evil || print -r -- "failed:$?"
+print -r -- "${FIRST-unset}|${ENVY_EVAL-unset}|${ENVY_ACTIVE-unset}|$ENVY_CONFIG_DIR"
+"#,
+    );
+    assert_eq!(
+        stdout(&out),
+        format!("failed:1\nunset|unset|unset|{}\n", dir.path().display())
+    );
+    let err = stderr(&out);
+    assert!(
+        err.contains("\"ENVY_CONFIG_DIR\"") && err.contains("ENVY_ prefix"),
+        "{err}"
+    );
+    assert!(!err.contains("zq-elsewhere"), "{err}");
+}

@@ -1273,4 +1273,17 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn envy_prefixed_names_are_refused_on_the_command_line() {
+        for args in [
+            &["work", "--plain", "ENVY_EVAL=1"][..],
+            &["work", "--plain", "ENVY_CONFIG_DIR"],
+            &["work", "--secret", "ENVY_X"],
+        ] {
+            let msg = error_text(args);
+            assert!(msg.contains("ENVY_ prefix"), "{args:?}: {msg}");
+        }
+        assert!(p(&["work", "--plain", "envy_x=1"]).is_ok());
+    }
 }

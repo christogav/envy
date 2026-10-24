@@ -1194,4 +1194,25 @@ mod tests {
             PathBuf::from("/h/.config/envy")
         );
     }
+
+    #[test]
+    fn an_existing_file_with_an_envy_prefixed_name_fails_to_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config::new(dir.path().to_path_buf());
+        fs::write(
+            dir.path().join("evil.toml"),
+            "[vars]\nENVY_CONFIG_DIR = \"/tmp/zq-x\"\n",
+        )
+        .unwrap();
+        let err = format!("{:#}", cfg.load("evil").unwrap_err());
+        assert!(
+            err.contains("ENVY_ prefix") && !err.contains("zq-x"),
+            "{err}"
+        );
+        fs::write(dir.path().join("ok.toml"), "[vars]\nenvy_x = \"1\"\n").unwrap();
+        assert_eq!(
+            cfg.load("ok").unwrap().vars(),
+            vec![("envy_x".to_string(), Value::Plain("1".into()))]
+        );
+    }
 }
