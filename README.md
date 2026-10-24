@@ -133,7 +133,7 @@ any name (even `off` or `new`).
 | `envy <ns>` | Load `<ns>`, first removing what the previous namespace set. |
 | `envy --off` | Remove what the active namespace set. |
 | `envy <ns> --new` | Create an empty namespace: in the nearest project `.envy/` folder if there is one, otherwise your own. |
-| `envy <ns> --new --project` | Create the namespace in this project's `.envy/` folder, making the folder (at the git repository root) if needed. |
+| `envy <ns> --new --project` | Create the namespace in a project `.envy/` folder, making the folder if needed: at the git repository root inside a repository, otherwise in the current directory. Refused in your home directory or above it. |
 | `envy <ns> --user`, `envy <ns> ... --user` | Use your own `<ns>` even when the project has one with the same name. Works with every command that takes a namespace. |
 | `envy <ns> --like <other>` | Create `<ns>` as a copy of `<other>`: copies its names and plain values, then prompts for each secret. One-time copy. |
 | `envy <ns> --secret NAME [NAME ...]` | Add or change secrets. Each value is typed at a hidden prompt and stored in the Keychain; a secret value is never accepted on the command line. |
@@ -243,7 +243,16 @@ Every command follows the same rule (`--secret`, `--plain`, `--edit`, `--list`,
 `--rm`, `--like`, `--link`, `--unlink`), and `--user` forces your own. `--new`
 creates in the nearest `.envy/` folder when there is one and in your own level
 otherwise; `--new --user` always creates your own, and `--new --project`
-creates the project's first file. Link groups stay within one level.
+creates the project's first file: at the git repository root inside a
+repository, otherwise in the current directory, and never in your home
+directory or a folder above it. Link groups stay within one level.
+
+- `--user` also applies to the `--like` source: `envy copy --new --like dev
+  --user` copies *your* `dev` into your own level. So a project namespace can't
+  be copied into your own level that way; to copy the project's, leave out
+  `--user` (the copy then goes where `--new` puts it).
+- `--new` says nothing about the other level: a name you create can shadow, or
+  be shadowed by, the same name at the other level. `envy --list` shows it.
 
 ```console
 $ envy --list
@@ -280,7 +289,7 @@ Say yes, and envy asks at a hidden prompt for each secret you don't have yet,
 saves them in the Keychain, and loads the namespace, all in one command.
 Cancel anything and nothing is saved or loaded. After that, `envy dev` just
 loads. This first load needs a terminal: run without one (in a script, say),
-an untrusted project namespace is an error and nothing is printed.
+an untrusted project namespace is an error and nothing is printed on stdout.
 
 **What the confirmation protects.** A project file can set any variable envy
 does not refuse, `NODE_OPTIONS` or `GIT_SSH_COMMAND` included, so loading one
@@ -317,6 +326,13 @@ directory does not lend its identity to folders under it.
 Project secrets are Keychain items with service `envy.project/<identity>/<ns>`
 (for example `envy.project/acme/api/dev`), account = the variable name. Every
 envy item still starts with `envy.`.
+
+**Which one is loaded.** Besides `ENVY_ACTIVE` (the name) and `ENVY_VARS` (the
+variables it set), envy records `ENVY_SOURCE` in your shell: `user`, or the
+project's `.envy` folder. `envy --list` uses it to star the level you loaded
+(even when it is shadowed, after `--user`), or says `(from another folder)` when
+you loaded it in another project. It is only compared, never run or used as a
+path, and a namespace file can't set any of the three.
 
 **Removing.** `envy dev --rm` on a project namespace deletes the file from the
 working tree (git status shows it). Its Keychain items are shared with every
