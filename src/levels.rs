@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 
 use crate::config::Config;
-use crate::project::identity_for_root;
+use crate::project::{encode_path, identity_for_root};
 
 /// Every `.envy/` level above a directory (nearest first), then the user level.
 pub struct Levels {
@@ -40,6 +40,17 @@ pub struct Entry {
     pub shadowed: bool,
 }
 
+/// How a level is named in `ENVY_SOURCE` and compared with it: `user`, or
+/// the percent-encoded path of a project's `.envy` folder (printable ASCII,
+/// never `user`: it starts with `/`).
+pub fn label(cfg: &Config) -> String {
+    if cfg.is_project() {
+        encode_path(cfg.dir())
+    } else {
+        "user".to_string()
+    }
+}
+
 /// The stderr line printed when a project namespace hides a user one.
 pub fn shadow_note(ns: &str) -> String {
     format!("note: project namespace {ns:?} shadows your user-level {ns:?}; use --user for yours")
@@ -64,7 +75,7 @@ impl Levels {
                 Err(e) if e.kind() == ErrorKind::NotFound => false,
                 // Fail closed: an unreadable ancestor may hide a project level.
                 Err(e) => {
-                    return Err(e).with_context(|| format!("cannot access {}", envy.display()));
+                    return Err(e).with_context(|| format!("cannot access {}", encode_path(&envy)));
                 }
             };
             if is_dir {
@@ -80,6 +91,7 @@ impl Levels {
     }
 
     /// No project level: what [`Levels::discover`] finds outside any project.
+    #[cfg(test)]
     pub fn user_only(user: Config) -> Levels {
         Levels {
             projects: Vec::new(),
@@ -144,9 +156,11 @@ impl Levels {
         }
         .unwrap_or(&cwd)
         .to_path_buf();
-        if root == home {
+        // Home itself and every folder above it (`/` included) hold the home
+        // directory, so a project there would cover it.
+        if home.starts_with(&root) {
             bail!(
-                "cannot create a project level in your home directory; cd into a project folder first"
+                "cannot create a project level in your home directory or a folder above it; cd into a project folder first"
             );
         }
         Ok(Config::project(
@@ -155,6 +169,16 @@ impl Levels {
             identity_for_root(&root, &home),
             user.dir().to_path_buf(),
         ))
+    }
+
+    /// How many levels have a file named `ns` (as [`Levels::resolve`] sees
+    /// them, ignoring `--user`).
+    pub fn count(&self, ns: &str) -> Result<usize> {
+        let mut n = usize::from(self.user.exists(ns)?);
+        for project in &self.projects {
+            n += usize::from(project.present(ns)?);
+        }
+        Ok(n)
     }
 
     /// Every namespace of every project level (nearest first), then the user
@@ -192,15 +216,15 @@ impl Levels {
 fn resolve_paths(cwd: &Path, home: &Path) -> Result<(PathBuf, PathBuf)> {
     for p in [cwd, home] {
         if !p.is_absolute() {
-            bail!("{} is not an absolute path", p.display());
+            bail!("{} is not an absolute path", encode_path(p));
         }
     }
     let cwd = cwd
         .canonicalize()
-        .with_context(|| format!("cannot resolve {}", cwd.display()))?;
+        .with_context(|| format!("cannot resolve {}", encode_path(cwd)))?;
     let home = home
         .canonicalize()
-        .with_context(|| format!("cannot resolve {}", home.display()))?;
+        .with_context(|| format!("cannot resolve {}", encode_path(home)))?;
     Ok((cwd, home))
 }
 
@@ -585,6 +609,43 @@ mod tests {
         assert_eq!(c.dir(), p.join(".envy"));
         assert_eq!(c.identity(), Some("~/p"));
         assert!(Levels::new_project_level(&f.home, &f.home, &user).is_err());
+    }
+
+    #[test]
+    fn new_project_level_is_refused_at_or_above_home() {
+        let f = fixture();
+        let user = f.user();
+        let above = f.home.parent().unwrap().to_path_buf();
+        for cwd in [f.home.clone(), above.clone(), PathBuf::from("/")] {
+            let err = Levels::new_project_level(&cwd, &f.home, &user)
+                .err()
+                .unwrap_or_else(|| panic!("{} was accepted", cwd.display()));
+            assert!(err.to_string().contains("home directory"), "{err}");
+        }
+        // Even with a `.git` above home (a repository holding the home).
+        fs::create_dir_all(above.join(".git")).unwrap();
+        assert!(Levels::new_project_level(&above, &f.home, &user).is_err());
+        assert!(!above.join(".envy").exists());
+        // A folder outside home, beside it, is unaffected.
+        let beside = above.join("beside");
+        fs::create_dir_all(&beside).unwrap();
+        fs::remove_dir_all(above.join(".git")).unwrap();
+        let c = Levels::new_project_level(&beside, &f.home, &user).unwrap();
+        assert_eq!(c.dir(), beside.join(".envy"));
+    }
+
+    #[test]
+    fn errors_escape_hostile_paths() {
+        let f = fixture();
+        let evil = f.home.join("ev\u{1b}[31mil\nx");
+        fs::create_dir_all(&evil).unwrap();
+        let gone = evil.join("gone");
+        let err = format!(
+            "{:#}",
+            Levels::discover(&gone, &f.home, f.user()).err().unwrap()
+        );
+        assert!(!err.chars().any(char::is_control), "{err:?}");
+        assert!(err.contains("ev%1B%5B31mil%0Ax"), "{err}");
     }
 
     #[test]

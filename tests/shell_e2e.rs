@@ -1279,7 +1279,150 @@ fn e2e_rm_on_a_project_namespace_needs_a_terminal_to_confirm() {
     p.put_project("dev", PROJECT_DEV);
     let out = p.envy(&p.repo, &["dev", "--rm"]);
     assert_eq!(out.status.code(), Some(1));
-    assert!(p.repo.join(".envy/dev.toml").is_file());
+    assert_eq!(stdout(&out), "");
+    let err = stderr(&out);
+    assert!(
+        err.contains("terminal") && err.contains("nothing was changed"),
+        "{err}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(p.repo.join(".envy/dev.toml")).unwrap(),
+        PROJECT_DEV
+    );
+}
+
+#[test]
+fn e2e_the_listing_stars_the_level_that_was_loaded() {
+    let p = project();
+    p.put_project("dev", PROJECT_DEV);
+    p.put_user("dev", USER_DEV);
+    p.trust("dev");
+    let label = encode_path(&p.repo.join(".envy"));
+    let out = p.zsh(
+        &p.repo,
+        &format!(
+            r#"envy dev --user
+print -r -- "[$ENVY_SOURCE]"
+envy
+cd {home}
+envy
+cd {repo}
+envy dev
+print -r -- "[$ENVY_SOURCE]"
+envy
+cd {home}
+envy
+envy --off
+print -r -- "[${{ENVY_SOURCE-unset}}]"
+"#,
+            home = sh_quote(&p.home.display().to_string()),
+            repo = sh_quote(&p.repo.display().to_string()),
+        ),
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(
+        stdout(&out),
+        format!(
+            "[user]\n\
+             project: {label}\n  dev\nuser:\n* dev (shadowed)\n\
+             * dev\n\
+             [{label}]\n\
+             project: {label}\n* dev\nuser:\n  dev (shadowed)\n\
+             \x20 dev\n* dev (from another folder)\n\
+             [unset]\n"
+        )
+    );
+}
+
+#[test]
+fn e2e_new_project_above_home_is_refused() {
+    let p = project();
+    let above = p.home.parent().unwrap().to_path_buf();
+    for cwd in [&above, &p.home] {
+        let out = p.envy(cwd, &["x", "--new", "--project"]);
+        assert_eq!(out.status.code(), Some(1), "{}", cwd.display());
+        assert_eq!(stdout(&out), "");
+        assert!(stderr(&out).contains("home directory"), "{}", stderr(&out));
+    }
+    assert!(!above.join(".envy").exists());
+    assert!(!p.home.join(".envy").exists());
+    assert!(!p.user.join("x.toml").exists());
+}
+
+/// In a repository whose `dev` shadows the user's, every changing command
+/// with `--user` changes the user's file and leaves the project's alone.
+#[test]
+fn e2e_user_flag_reaches_the_users_namespace_in_every_command() {
+    let p = project();
+    p.put_project("dev", PROJECT_DEV);
+    p.put_user("dev", USER_DEV);
+    let project_file = p.repo.join(".envy/dev.toml");
+    let user_file = p.user.join("dev.toml");
+    let read = |path: &Path| std::fs::read_to_string(path).unwrap();
+    let project_unchanged = || assert_eq!(read(&project_file), PROJECT_DEV);
+
+    let out = p.envy(&p.repo, &["dev", "--plain", "X=1", "--user"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stderr(&out), "saved X in \"dev\"\n");
+    let user_text = format!("{USER_DEV}X = \"1\"\n");
+    assert_eq!(read(&user_file), user_text);
+    project_unchanged();
+
+    let out = p.envy(&p.repo, &["dev", "--link", "g", "--user"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(read(&user_file), format!("link = \"g\"\n{user_text}"));
+    project_unchanged();
+    let out = p.envy(&p.repo, &["dev", "--unlink", "--user"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(read(&user_file), user_text);
+    project_unchanged();
+
+    let (_ed, script) = editor_script("printf 'NEW = \"added\"\\n' >> \"$1\"");
+    let mut cmd = Command::new(ENVY);
+    cmd.args(["dev", "--edit", "--user"]).env("VISUAL", &script);
+    p.env(&mut cmd, &p.repo);
+    let out = detached(cmd);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let user_text = format!("{user_text}NEW = \"added\"\n");
+    assert_eq!(read(&user_file), user_text);
+    project_unchanged();
+
+    // `--like` with `--user` copies the user's `dev`, into the user level.
+    let out = p.envy(&p.repo, &["copy", "--new", "--like", "dev", "--user"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(read(&p.user.join("copy.toml")), user_text);
+    assert!(!p.repo.join(".envy/copy.toml").exists());
+    // Without it, the project's `dev`, into the project.
+    p.trust("dev");
+    let out = p.envy(&p.repo, &["copy2", "--new", "--like", "dev"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(read(&p.repo.join(".envy/copy2.toml")), PROJECT_DEV);
+    assert!(!p.user.join("copy2.toml").exists());
+
+    // `--rm --user` asks first, and there is no terminal to ask on.
+    let out = p.envy(&p.repo, &["dev", "--rm", "--user"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(stdout(&out), "");
+    assert!(stderr(&out).contains("terminal"), "{}", stderr(&out));
+    assert_eq!(read(&user_file), user_text);
+    project_unchanged();
+}
+
+#[test]
+fn e2e_a_deleted_current_directory_says_what_to_do() {
+    let p = project();
+    let gone = p.home.join("gone");
+    std::fs::create_dir_all(&gone).unwrap();
+    let out = p.zsh(
+        &gone,
+        &format!(
+            "rmdir {}\nenvy --list",
+            sh_quote(&gone.display().to_string())
+        ),
+    );
+    assert_eq!(stdout(&out), "");
+    let err = stderr(&out);
+    assert!(err.contains("cd to an existing folder"), "{err}");
 }
 
 #[test]

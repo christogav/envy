@@ -1,6 +1,6 @@
 use anyhow::{Result, bail};
 
-const RESERVED_VARS: [&str; 2] = ["ENVY_ACTIVE", "ENVY_VARS"];
+const RESERVED_VARS: [&str; 3] = ["ENVY_ACTIVE", "ENVY_SOURCE", "ENVY_VARS"];
 
 /// zsh's special parameters. Activation runs `export NAME='value'` in the
 /// user's shell, and for these that is not a plain assignment: integer
@@ -318,7 +318,7 @@ mod tests {
 
     #[test]
     fn var_rejects_invalid() {
-        for n in ["1A", "A-B", "", "ENVY_ACTIVE", "ENVY_VARS"] {
+        for n in ["1A", "A-B", "", "ENVY_ACTIVE", "ENVY_VARS", "ENVY_SOURCE"] {
             assert!(validate_var(n).is_err(), "{n:?}");
         }
     }

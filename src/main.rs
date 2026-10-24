@@ -71,7 +71,9 @@ impl Here {
                 "HOME is not set; envy needs it to know where to stop looking for a project's .envy folder"
             ),
         };
-        let cwd = std::env::current_dir().context("cannot read the current directory")?;
+        let cwd = std::env::current_dir().context(
+            "cannot read the current directory (was it deleted?); cd to an existing folder and try again",
+        )?;
         let levels = Levels::discover(&cwd, &home, Config::from_env()?)?;
         Ok(Here { cwd, home, levels })
     }

@@ -10,7 +10,7 @@ use anyhow::{Context, Result, bail};
 
 use crate::activate::{ActiveState, render_activate};
 use crate::config::{Config, NamespaceFile, SECRET_MARKER, Value};
-use crate::levels::{Entry, Level, Levels};
+use crate::levels::{Entry, Level, Levels, label};
 use crate::link;
 use crate::names::{validate_namespace, validate_var};
 use crate::project::encode_path;
@@ -65,7 +65,7 @@ pub fn activate(ctx: &Ctx, ns: &str, prev: &ActiveState) -> Result<String> {
     // a failure here prints nothing. The new secrets and the trust record
     // both stay: the user entered and confirmed them, and a render failure
     // does not roll either back.
-    render_activate(&file, prev, ctx.store)
+    render_activate(&file, &label(ctx.cfg), prev, ctx.store)
 }
 
 /// How prompts name a namespace: with its project at project level, so the
@@ -186,17 +186,24 @@ pub(crate) fn record_trust(ctx: &Ctx, file: &NamespaceFile) -> Result<()> {
 /// levels, each level gets a block, nearest project first and the user level
 /// last, introduced by `project: <its .envy folder>` (percent-encoded, as the
 /// path is the repository's to choose) or `user:`. A name that a nearer level
-/// already provides is marked ` (shadowed)`; the `*` goes on the row that
-/// `envy <name>` would load.
+/// already provides is marked ` (shadowed)`. The `*` marks the row that was
+/// loaded ([`is_active`]); when no row is that one, a last line says the
+/// active namespace no longer exists or was loaded from another folder.
 pub fn status(levels: &Levels, active: &ActiveState) -> Result<String> {
     let entries = levels.entries()?;
-    let active_ns = active.namespace.as_deref();
+    let level_label = |level: &Level| match level {
+        Level::User => "user".to_string(),
+        Level::Project { dir } => encode_path(dir),
+    };
+    let count = |name: &str| entries.iter().filter(|e| e.name == name).count();
+    let starred = |e: &Entry| {
+        is_active(active, &e.name, &level_label(&e.level), e.shadowed, || {
+            Ok(count(&e.name))
+        })
+        .unwrap_or(false)
+    };
     let row = |e: &Entry| {
-        let marker = if !e.shadowed && active_ns == Some(e.name.as_str()) {
-            "*"
-        } else {
-            " "
-        };
+        let marker = if starred(e) { "*" } else { " " };
         let shadowed = if e.shadowed { " (shadowed)" } else { "" };
         format!("{marker} {}{shadowed}\n", e.name)
     };
@@ -217,7 +224,7 @@ pub fn status(levels: &Levels, active: &ActiveState) -> Result<String> {
         out.extend(entries.iter().map(row));
     } else if !entries.is_empty() {
         for project in levels.projects() {
-            out.push_str(&format!("project: {}\n", encode_path(project.dir())));
+            out.push_str(&format!("project: {}\n", label(project)));
             out.push_str(&block(&Level::Project {
                 dir: project.dir().to_path_buf(),
             }));
@@ -225,15 +232,47 @@ pub fn status(levels: &Levels, active: &ActiveState) -> Result<String> {
         out.push_str("user:\n");
         out.push_str(&block(&Level::User));
     }
-    if let Some(ns) = active_ns
-        && !entries.iter().any(|e| e.name == ns)
+    if let Some(ns) = active.namespace.as_deref()
+        && !entries.iter().any(|e| e.name == ns && starred(e))
     {
-        out.push_str(&format!("* {ns} (no longer exists)\n"));
+        // An old shell (no source) with an ambiguous name marks nothing and
+        // adds nothing: the name does exist.
+        let ambiguous = active.source.is_none() && count(ns) > 1;
+        let elsewhere = match active.source.as_deref() {
+            None | Some("user") => false,
+            Some(src) => !levels.projects().iter().any(|p| label(p) == src),
+        };
+        if elsewhere {
+            out.push_str(&format!("* {ns} (from another folder)\n"));
+        } else if !ambiguous {
+            out.push_str(&format!("* {ns} (no longer exists)\n"));
+        }
     }
     if out.is_empty() {
         out.push_str("no namespaces yet; create one with: envy <name> --new\n");
     }
     Ok(out)
+}
+
+/// Whether namespace `name` at the level labelled `level` is the one the
+/// shell loaded. With `ENVY_SOURCE`, the name and the level must both match.
+/// A shell from before it existed records no level: then the unshadowed row
+/// of the name counts, but only if just one level has the name (`count`),
+/// since which one was loaded is unknown.
+fn is_active(
+    active: &ActiveState,
+    name: &str,
+    level: &str,
+    shadowed: bool,
+    count: impl FnOnce() -> Result<usize>,
+) -> Result<bool> {
+    if active.namespace.as_deref() != Some(name) {
+        return Ok(false);
+    }
+    Ok(match active.source.as_deref() {
+        Some(source) => source == level,
+        None => !shadowed && count()? <= 1,
+    })
 }
 
 /// Shows the variables of namespace `ns`, resolved as `envy <ns>` would
@@ -243,7 +282,8 @@ pub fn status(levels: &Levels, active: &ActiveState) -> Result<String> {
 /// only the namespace file: it takes no `SecretStore`, so a secret value can
 /// never be fetched, let alone printed. Plain values are quoted and escaped
 /// ([`quote_for_display`]) so they cannot disturb the terminal or the layout;
-/// a project file's path is percent-encoded for the same reason.
+/// a project file's path is percent-encoded for the same reason. `(active)`
+/// only when this level's `ns` is the one loaded ([`is_active`]).
 pub fn list_vars(
     levels: &Levels,
     ns: &str,
@@ -253,7 +293,7 @@ pub fn list_vars(
     let cfg = levels.resolve(ns, force_user)?.cfg;
     let file = cfg.load(ns)?;
     let mut out = format!("namespace: {ns}");
-    if active.namespace.as_deref() == Some(ns) {
+    if is_active(active, ns, &label(cfg), false, || levels.count(ns))? {
         out.push_str(" (active)");
     }
     out.push('\n');
@@ -813,7 +853,13 @@ pub fn remove(ctx: &Ctx, ns: &str) -> Result<Vec<String>> {
             "Delete project namespace {ns:?}? Its file is removed from the working tree \
              (git status may show it)."
         );
-        if !ctx.prompt.confirm(&q1)? {
+        let no_terminal = || {
+            format!(
+                "deleting project namespace {ns:?} needs a terminal to confirm \
+                 (run envy {ns} --rm in a terminal); nothing was changed"
+            )
+        };
+        if !ctx.prompt.confirm(&q1).with_context(no_terminal)? {
             bail!("cancelled; nothing was changed");
         }
         delete_items = !secrets.is_empty() && {
@@ -823,7 +869,7 @@ pub fn remove(ctx: &Ctx, ns: &str) -> Result<Vec<String>> {
                 secrets.len(),
                 secrets.join(", ")
             );
-            ctx.prompt.confirm(&q2)?
+            ctx.prompt.confirm(&q2).with_context(no_terminal)?
         };
     } else {
         let question = if secrets.is_empty() {
@@ -974,7 +1020,7 @@ fn load_for_edit(cfg: &Config, ns: &str) -> Result<NamespaceFile> {
         Ok(file) => Ok(file),
         Err(e) if cfg.exists(ns).unwrap_or(false) => Err(e.context(format!(
             "cannot edit {}: envy needs the current file to compare against, so fix it by hand first",
-            cfg.dir().join(format!("{ns}.toml")).display()
+            encode_path(&cfg.dir().join(format!("{ns}.toml")))
         ))),
         Err(e) => Err(e),
     }
@@ -1035,11 +1081,33 @@ mod tests {
         (tmp, home, levels)
     }
 
-    fn active(ns: &str) -> ActiveState {
+    /// `ns` active, loaded from the level labelled `source` (`None`: a
+    /// shell from before `ENVY_SOURCE` existed).
+    fn act(ns: &str, source: Option<&str>) -> ActiveState {
         ActiveState {
             namespace: Some(ns.into()),
             vars: vec!["A".into()],
+            source: source.map(str::to_string),
         }
+    }
+
+    /// The nested listing with `marks` (one char per row, in order: inner
+    /// dev, inner web, outer ci, outer dev, user dev, user mine).
+    fn nested_body(home: &Path, marks: &str) -> String {
+        let m: Vec<char> = marks.chars().collect();
+        assert_eq!(m.len(), 6);
+        format!(
+            "project: {}\n{} dev\n{} web\nproject: {}\n{} ci\n{} dev (shadowed)\n\
+             user:\n{} dev (shadowed)\n{} mine\n",
+            encode_path(&home.join("a/b/.envy")),
+            m[0],
+            m[1],
+            encode_path(&home.join("a/.envy")),
+            m[2],
+            m[3],
+            m[4],
+            m[5],
+        )
     }
 
     #[test]
@@ -1047,23 +1115,133 @@ mod tests {
         let (_tmp, home, levels) = nested_levels();
         let inner = encode_path(&home.join("a/b/.envy"));
         let outer = encode_path(&home.join("a/.envy"));
-        let body = |dev: &str, mine: &str| {
+        let st = |a: &ActiveState| status(&levels, a).unwrap();
+        assert_eq!(st(&ActiveState::default()), nested_body(&home, "      "));
+        // The star goes on the row of the level the namespace was loaded from,
+        // shadowed or not.
+        assert_eq!(st(&act("dev", Some(&inner))), nested_body(&home, "*     "));
+        assert_eq!(st(&act("dev", Some(&outer))), nested_body(&home, "   *  "));
+        assert_eq!(st(&act("dev", Some("user"))), nested_body(&home, "    * "));
+        assert_eq!(st(&act("mine", Some("user"))), nested_body(&home, "     *"));
+        assert_eq!(st(&act("ci", Some(&outer))), nested_body(&home, "  *   "));
+        // The right name at the wrong level is not the active one.
+        assert_eq!(
+            st(&act("mine", Some(&inner))),
             format!(
-                "project: {inner}\n{dev} dev\n  web\nproject: {outer}\n  ci\n  dev (shadowed)\n\
-                 user:\n  dev (shadowed)\n{mine} mine\n"
+                "{}* mine (no longer exists)\n",
+                nested_body(&home, "      ")
             )
-        };
-        assert_eq!(
-            status(&levels, &ActiveState::default()).unwrap(),
-            body(" ", " ")
         );
-        // The active name is marked once: on the row that provides it.
-        assert_eq!(status(&levels, &active("dev")).unwrap(), body("*", " "));
-        assert_eq!(status(&levels, &active("mine")).unwrap(), body(" ", "*"));
         assert_eq!(
-            status(&levels, &active("gone")).unwrap(),
-            format!("{}* gone (no longer exists)\n", body(" ", " "))
+            st(&act("gone", Some("user"))),
+            format!(
+                "{}* gone (no longer exists)\n",
+                nested_body(&home, "      ")
+            )
         );
+        assert_eq!(
+            st(&act("dev", Some("/elsewhere/.envy"))),
+            format!(
+                "{}* dev (from another folder)\n",
+                nested_body(&home, "      ")
+            )
+        );
+    }
+
+    #[test]
+    fn status_from_a_shell_without_envy_source_marks_only_an_unambiguous_name() {
+        let (_tmp, home, levels) = nested_levels();
+        let st = |a: &ActiveState| status(&levels, a).unwrap();
+        // `dev` is at three levels: which one was loaded is unknown.
+        assert_eq!(st(&act("dev", None)), nested_body(&home, "      "));
+        assert_eq!(st(&act("web", None)), nested_body(&home, " *    "));
+        assert_eq!(st(&act("mine", None)), nested_body(&home, "     *"));
+        assert_eq!(
+            st(&act("gone", None)),
+            format!(
+                "{}* gone (no longer exists)\n",
+                nested_body(&home, "      ")
+            )
+        );
+        // Outside any project: today's output.
+        let user = Levels::user_only(levels.user().clone());
+        assert_eq!(status(&user, &act("dev", None)).unwrap(), "* dev\n  mine\n");
+    }
+
+    /// The four cases a reviewer reproduced, in a repository with a project
+    /// `dev` and `web` and a user `dev` and `mine`.
+    #[test]
+    fn the_marker_follows_the_level_that_was_loaded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().canonicalize().unwrap();
+        let home = base.join("home");
+        let user = base.join("user");
+        let repo = home.join("repo");
+        for (dir, names) in [
+            (repo.join(".envy"), &["dev", "web"][..]),
+            (user.clone(), &["dev", "mine"]),
+        ] {
+            std::fs::create_dir_all(&dir).unwrap();
+            for n in names {
+                std::fs::write(dir.join(format!("{n}.toml")), "[vars]\nA = \"1\"\n").unwrap();
+            }
+        }
+        let in_repo = Levels::discover(&repo, &home, Config::new(user.clone())).unwrap();
+        let at_home = Levels::discover(&home, &home, Config::new(user.clone())).unwrap();
+        let label = encode_path(&repo.join(".envy"));
+
+        // 1. `envy dev --user` in the repository: the user row is starred.
+        let mine = act("dev", Some("user"));
+        assert_eq!(
+            status(&in_repo, &mine).unwrap(),
+            format!("project: {label}\n  dev\n  web\nuser:\n* dev (shadowed)\n  mine\n")
+        );
+        // 2. ... and only `--list --user` says active.
+        assert_eq!(
+            list_vars(&in_repo, "dev", true, &mine).unwrap(),
+            "namespace: dev (active)\nsource: user\n\nA  \"1\"\n"
+        );
+        assert_eq!(
+            list_vars(&in_repo, "dev", false, &mine).unwrap(),
+            format!("namespace: dev\nsource: project ({label}/dev.toml)\n\nA  \"1\"\n")
+        );
+        // 3. The project's `dev` loaded, then `cd ~`: not the user's `dev`.
+        let theirs = act("dev", Some(&label));
+        assert_eq!(
+            status(&at_home, &theirs).unwrap(),
+            "  dev\n  mine\n* dev (from another folder)\n"
+        );
+        assert_eq!(
+            list_vars(&at_home, "dev", false, &theirs).unwrap(),
+            "namespace: dev\nsource: user\n\nA  \"1\"\n"
+        );
+        // 4. A project-only `web` seen from home still exists.
+        assert_eq!(
+            status(&at_home, &act("web", Some(&label))).unwrap(),
+            "  dev\n  mine\n* web (from another folder)\n"
+        );
+        // Back in the repository it is starred where it lives.
+        assert_eq!(
+            status(&in_repo, &act("web", Some(&label))).unwrap(),
+            format!("project: {label}\n  dev\n* web\nuser:\n  dev (shadowed)\n  mine\n")
+        );
+        // Its file deleted: gone, not elsewhere.
+        std::fs::remove_file(repo.join(".envy/web.toml")).unwrap();
+        assert_eq!(
+            status(&in_repo, &act("web", Some(&label))).unwrap(),
+            format!(
+                "project: {label}\n  dev\nuser:\n  dev (shadowed)\n  mine\n* web (no longer exists)\n"
+            )
+        );
+    }
+
+    #[test]
+    fn list_vars_from_an_old_shell_says_active_only_when_unambiguous() {
+        let (_tmp, _home, levels) = nested_levels();
+        let out = list_vars(&levels, "dev", false, &act("dev", None)).unwrap();
+        assert!(out.starts_with("namespace: dev\n"), "{out}");
+        let out = list_vars(&levels, "web", false, &act("web", None)).unwrap();
+        assert!(out.starts_with("namespace: web (active)\n"), "{out}");
     }
 
     #[test]
@@ -1110,7 +1288,13 @@ mod tests {
         let (_tmp, home, levels) = nested_levels();
         let file = encode_path(&home.join("a/b/.envy/dev.toml"));
         assert_eq!(
-            list_vars(&levels, "dev", false, &active("dev")).unwrap(),
+            list_vars(
+                &levels,
+                "dev",
+                false,
+                &act("dev", Some(&encode_path(&home.join("a/b/.envy"))))
+            )
+            .unwrap(),
             format!("namespace: dev (active)\nsource: project ({file})\n\nA  \"1\"\n")
         );
         // The outer level's own name, found walking up.
@@ -1150,6 +1334,7 @@ mod tests {
         let active = ActiveState {
             namespace: Some("work".into()),
             vars: vec!["A".into(), "B".into()],
+            source: Some("user".into()),
         };
         let out = status(&user_levels(&cfg), &active).unwrap();
         assert_eq!(out, "  personal\n* work\n");
@@ -1204,6 +1389,7 @@ mod tests {
         let active = ActiveState {
             namespace: Some("dev".into()),
             vars: vec!["A".into()],
+            source: Some("user".into()),
         };
         assert_eq!(
             list_vars(&user_levels(&cfg), "dev", false, &active).unwrap(),
@@ -1350,6 +1536,7 @@ mod tests {
         let active = ActiveState {
             namespace: Some("gone".into()),
             vars: vec![],
+            source: Some("user".into()),
         };
         assert_eq!(
             status(&user_levels(&cfg), &active).unwrap(),
@@ -1371,7 +1558,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             out,
-            "export ENVY_ACTIVE='work'\nexport ENVY_VARS='A B'\nexport A='x'\nexport B='s'\n"
+            "export ENVY_ACTIVE='work'\nexport ENVY_SOURCE='user'\nexport ENVY_VARS='A B'\nexport A='x'\nexport B='s'\n"
         );
     }
 
@@ -3465,8 +3652,11 @@ mod tests {
         .unwrap();
         assert_eq!(
             out,
-            "export ENVY_ACTIVE='dev'\nexport ENVY_VARS='REGION TOKEN API_KEY'\n\
-             export REGION='eu'\nexport TOKEN='tok-1'\nexport API_KEY='key-1'\n"
+            format!(
+                "export ENVY_ACTIVE='dev'\nexport ENVY_SOURCE='{}'\nexport ENVY_VARS='REGION TOKEN API_KEY'\n\
+                 export REGION='eu'\nexport TOKEN='tok-1'\nexport API_KEY='key-1'\n",
+                encode_path(cfg.dir())
+            )
         );
         assert_eq!(
             snap(&store),
@@ -3756,7 +3946,12 @@ mod tests {
             &ActiveState::default(),
         )
         .unwrap();
-        assert_eq!(out_a, out_b);
+        // The same values, each recording its own checkout as the source.
+        assert_eq!(
+            out_a.replace(&encode_path(a.dir()), "<checkout>"),
+            out_b.replace(&encode_path(b.dir()), "<checkout>")
+        );
+        assert!(out_b.contains(&format!("export ENVY_SOURCE='{}'\n", encode_path(b.dir()))));
         let asked = second.asked();
         assert_eq!(asked.len(), 1, "{asked:?}");
         let Asked::Confirm(text) = &asked[0] else {
@@ -4135,6 +4330,40 @@ mod tests {
             let Asked::Confirm(t) = a else { panic!() };
             assert!(!t.contains("trust"), "{t}");
         }
+    }
+
+    #[test]
+    fn remove_project_without_a_terminal_says_nothing_was_changed() {
+        let base = tempfile::tempdir().unwrap();
+        let cfg = checkout(base.path(), "a", RM);
+        let store = rm_store();
+        let before = store.snapshot();
+        let err = remove(
+            &Ctx {
+                cfg: &cfg,
+                store: &store,
+                prompt: &NoTerminal,
+            },
+            "dev",
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("terminal") && msg.contains("nothing was changed"),
+            "{msg}"
+        );
+        // The second question failing (no answer left) changes nothing either.
+        let prompt = ScriptedPrompter::new().with_confirm(true);
+        let err = remove(&ctx_of(&cfg, &store, &prompt), "dev").unwrap_err();
+        assert!(
+            format!("{err:#}").contains("nothing was changed"),
+            "{err:#}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(base.path().join("a/.envy/dev.toml")).unwrap(),
+            RM
+        );
+        assert_eq!(store.snapshot(), before);
     }
 
     #[test]

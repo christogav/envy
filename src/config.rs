@@ -9,6 +9,7 @@ use anyhow::{Context, Result, bail};
 use toml_edit::{DocumentMut, Item, Table, TableLike};
 
 use crate::names::{validate_namespace, validate_var};
+use crate::project::encode_path;
 
 /// The value that marks a variable as a secret stored in the Keychain.
 pub const SECRET_MARKER: &str = "@keychain";
@@ -530,7 +531,7 @@ impl Config {
         if project && fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink()) {
             bail!(
                 "refusing project namespace {name:?} ({}): it is a symlink",
-                path.display()
+                encode_path(&path)
             );
         }
         let text = match fs::read_to_string(&path) {
@@ -542,7 +543,7 @@ impl Config {
                 return Err(e).with_context(|| {
                     format!(
                         "cannot read project namespace {name:?} ({})",
-                        path.display()
+                        encode_path(&path)
                     )
                 });
             }
@@ -550,7 +551,7 @@ impl Config {
         };
         let mut file = if project {
             NamespaceFile::parse(name, &text)
-                .map_err(|e| anyhow::anyhow!("{e} ({})", path.display()))?
+                .map_err(|e| anyhow::anyhow!("{e} ({})", encode_path(&path)))?
         } else {
             NamespaceFile::parse(name, &text)?
         };
@@ -918,6 +919,50 @@ mod tests {
         }
         assert!(f.vars().is_empty());
         assert!(NamespaceFile::parse("w", "[vars]\n\"A B\" = \"x\"\n").is_err());
+    }
+
+    #[test]
+    fn project_load_errors_escape_a_hostile_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("ev\u{1b}[31mil\n\u{202e}x");
+        let cfg = Config::project(
+            root.join(".envy"),
+            root.clone(),
+            "acme/api".into(),
+            tmp.path().join("user"),
+        );
+        fs::create_dir_all(cfg.dir()).unwrap();
+        let file = cfg.dir().join("dev.toml");
+        let check = |what: &str| {
+            let err = cfg.load("dev").unwrap_err();
+            let text = format!("{err:#} {err:?}");
+            assert!(
+                text.contains("ev%1B%5B31mil%0A%E2%80%AEx"),
+                "{what}: {text}"
+            );
+            assert!(
+                !format!("{err:#}")
+                    .chars()
+                    .any(|c| c.is_control() || c == '\u{202e}'),
+                "{what}: {err:#}"
+            );
+        };
+        fs::write(&file, "not [toml").unwrap();
+        check("garbage");
+        fs::remove_file(&file).unwrap();
+        std::os::unix::fs::symlink("/nonexistent", &file).unwrap();
+        check("symlink");
+        fs::remove_file(&file).unwrap();
+        fs::create_dir(&file).unwrap();
+        check("directory");
+    }
+
+    #[test]
+    fn a_file_cannot_define_envy_source() {
+        let err = NamespaceFile::parse("w", "[vars]\nENVY_SOURCE = \"user\"\n").unwrap_err();
+        assert!(format!("{err:#}").contains("ENVY_SOURCE"), "{err:#}");
+        let mut f = NamespaceFile::empty("w").unwrap();
+        assert!(f.set_var("ENVY_SOURCE", Value::Secret).is_err());
     }
 
     #[test]
