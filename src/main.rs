@@ -82,7 +82,12 @@ fn run(action: Action) -> Result<String> {
                 prompt: &TtyPrompter,
             };
             let source = like.map(|n| cfg.load(&n)).transpose()?;
-            commands::create(&ctx, &ns, source.as_ref(), link.as_deref())?;
+            commands::create(
+                &ctx,
+                &ns,
+                source.as_ref().map(|f| (&cfg, f)),
+                link.as_deref(),
+            )?;
             eprintln!("created namespace {ns:?}");
             Ok(String::new())
         }

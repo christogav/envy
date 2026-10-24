@@ -342,19 +342,20 @@ pub(crate) fn fill_missing(
     secrets: &mut Vec<(String, Secret)>,
 ) -> Result<()> {
     let ns = file.name().to_string();
+    let shown = crate::commands::display_ns(ctx.cfg, &ns);
     for (name, secret) in names {
         let nothing = || format!("no value for {name} in {ns:?}; nothing was changed");
         if *secret {
             let value = ctx
                 .prompt
-                .secret(&secret_label(name, &ns))
+                .secret(&secret_label(name, &shown))
                 .with_context(nothing)?;
             file.set_var(name, Value::Secret)?;
             secrets.push((name.clone(), value));
         } else {
             let value = ctx
                 .prompt
-                .plain(&plain_label(name, &ns), None)
+                .plain(&plain_label(name, &shown), None)
                 .with_context(nothing)?;
             file.set_var(name, Value::Plain(value))?;
         }
@@ -1612,7 +1613,7 @@ mod tests {
         create(
             &ctx(&cfg, &store, &prompt),
             "m",
-            Some(&cfg.load("a").unwrap()),
+            Some((&cfg, &cfg.load("a").unwrap())),
             Some("gcp"),
         )
         .unwrap();
@@ -1635,7 +1636,7 @@ mod tests {
         let err = create(
             &ctx(&cfg, &store, &prompt),
             "n",
-            Some(&cfg.load("src").unwrap()),
+            Some((&cfg, &cfg.load("src").unwrap())),
             Some("aws"),
         )
         .unwrap_err()

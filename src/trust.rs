@@ -163,6 +163,25 @@ impl TrustStore {
 /// the Keychain; no value can reach this function. The text ends without a
 /// question mark: the prompter appends `[y/N]: `.
 pub fn confirmation_text(cfg: &Config, file: &NamespaceFile, in_keychain: &[String]) -> String {
+    confirmation_text_for(cfg, file, in_keychain, Purpose::Load)
+}
+
+/// What the user is asked to allow with a project namespace file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Purpose {
+    /// Load the variables into the current shell.
+    Load,
+    /// Copy the names and plain values into a new namespace (`--new --like`).
+    Copy,
+}
+
+/// [`confirmation_text`] for a given purpose: only the closing line differs.
+pub fn confirmation_text_for(
+    cfg: &Config,
+    file: &NamespaceFile,
+    in_keychain: &[String],
+    purpose: Purpose,
+) -> String {
     let ns = file.name();
     let mut out = match cfg.identity() {
         Some(id) => format!("Project namespace \"{ns}\" from {id}\n"),
@@ -192,7 +211,10 @@ pub fn confirmation_text(cfg: &Config, file: &NamespaceFile, in_keychain: &[Stri
             }
         }
     }
-    out.push_str("\nAllow envy to load these variables into your current shell");
+    out.push_str(match purpose {
+        Purpose::Load => "\nAllow envy to load these variables into your current shell",
+        Purpose::Copy => "\nAllow envy to copy these names and plain values into a new namespace",
+    });
     out
 }
 
@@ -379,6 +401,26 @@ mod tests {
         );
         assert_eq!(text, expected);
         assert!(!text.contains('?') && !text.contains("[y/N]"));
+    }
+
+    #[test]
+    fn confirmation_closing_line_names_the_purpose() {
+        let (_root, _user, cfg) = project_cfg(&[("dev", "[vars]\nA = \"1\"\n")], "acme/api");
+        let file = cfg.load("dev").unwrap();
+        let load = confirmation_text_for(&cfg, &file, &[], Purpose::Load);
+        let copy = confirmation_text_for(&cfg, &file, &[], Purpose::Copy);
+        assert_eq!(load, confirmation_text(&cfg, &file, &[]));
+        assert!(load.ends_with("\n\nAllow envy to load these variables into your current shell"));
+        assert!(
+            copy.ends_with(
+                "\n\nAllow envy to copy these names and plain values into a new namespace"
+            )
+        );
+        assert!(!copy.contains('?') && !copy.contains("[y/N]"));
+        assert_eq!(
+            load.rsplit_once("\n\n").unwrap().0,
+            copy.rsplit_once("\n\n").unwrap().0
+        );
     }
 
     #[test]
