@@ -2,6 +2,7 @@ pub mod activate;
 pub mod cli;
 pub mod commands;
 pub mod config;
+mod display;
 pub mod editor;
 pub mod init;
 pub mod levels;

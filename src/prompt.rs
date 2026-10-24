@@ -11,6 +11,7 @@ use std::sync::Mutex;
 
 use anyhow::{Context, Result, anyhow, bail};
 
+use crate::display::quote_for_display;
 use crate::secret::Secret;
 
 pub trait Prompter {
@@ -70,6 +71,16 @@ fn finish_plain(raw: &str, default: Option<&str>) -> Result<String> {
     vet_plain(value.to_string())
 }
 
+/// The text of a visible prompt. The default is the current value, which a
+/// project file controls, so it is shown quoted and escaped as `--list` shows
+/// it; an empty answer still keeps the real value ([`finish_plain`]).
+fn plain_prompt(label: &str, default: Option<&str>) -> String {
+    match default {
+        Some(d) => format!("{label} [{}]: ", quote_for_display(d)),
+        None => format!("{label}: "),
+    }
+}
+
 fn parse_confirm(raw: &str) -> bool {
     matches!(raw.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
@@ -107,11 +118,7 @@ impl Prompter for TtyPrompter {
     }
 
     fn plain(&self, label: &str, default: Option<&str>) -> Result<String> {
-        let prompt = match default {
-            Some(d) => format!("{label} [{d}]: "),
-            None => format!("{label}: "),
-        };
-        finish_plain(&Self::ask(&prompt)?, default)
+        finish_plain(&Self::ask(&plain_prompt(label, default))?, default)
     }
 
     fn confirm(&self, question: &str) -> Result<bool> {
@@ -338,5 +345,24 @@ mod tests {
         for no in ["", "n", "no", "yep", "ye", "\n"] {
             assert!(!parse_confirm(no), "{no:?}");
         }
+    }
+
+    #[test]
+    fn the_plain_default_is_escaped_in_the_prompt_but_kept_as_is() {
+        let raw = "a\u{1b}]52;c;ZXZpbA==\u{7}\nb\u{202e}c\u{e0041}d";
+        let text = plain_prompt("Value for A in dev", Some(raw));
+        assert_eq!(
+            text,
+            "Value for A in dev [\"a\\u{1b}]52;c;ZXZpbA==\\u{7}\\nb\\u{202e}c\\u{e0041}d\"]: "
+        );
+        assert!(
+            !text
+                .chars()
+                .any(|c| c.is_control() || c == '\u{202e}' || c == '\u{e0041}'),
+            "{text:?}"
+        );
+        assert_eq!(plain_prompt("L", None), "L: ");
+        // An empty answer keeps the real value, not its escaped form.
+        assert_eq!(finish_plain("\n", Some(raw)).unwrap(), raw);
     }
 }
