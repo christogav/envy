@@ -10,8 +10,10 @@ use anyhow::{Context, Result, bail};
 
 use crate::activate::{ActiveState, render_activate};
 use crate::config::{Config, NamespaceFile, SECRET_MARKER, Value};
+use crate::levels::{Entry, Level, Levels};
 use crate::link;
 use crate::names::{validate_namespace, validate_var};
+use crate::project::encode_path;
 use crate::prompt::{Prompter, plain_label, secret_label, vet_plain};
 use crate::secret::Secret;
 use crate::store::SecretStore;
@@ -179,19 +181,52 @@ pub(crate) fn record_trust(ctx: &Ctx, file: &NamespaceFile) -> Result<()> {
 
 /// Lists namespace names, one per line, `* ` marking the active one. Names
 /// only: never values, secret or plain.
-pub fn status(cfg: &Config, active: &ActiveState) -> Result<String> {
-    let names = cfg.list()?;
-    let mut out = String::new();
-    for name in &names {
-        let marker = if active.namespace.as_deref() == Some(name) {
+///
+/// Outside any project this is the user level's names alone. With project
+/// levels, each level gets a block, nearest project first and the user level
+/// last, introduced by `project: <its .envy folder>` (percent-encoded, as the
+/// path is the repository's to choose) or `user:`. A name that a nearer level
+/// already provides is marked ` (shadowed)`; the `*` goes on the row that
+/// `envy <name>` would load.
+pub fn status(levels: &Levels, active: &ActiveState) -> Result<String> {
+    let entries = levels.entries()?;
+    let active_ns = active.namespace.as_deref();
+    let row = |e: &Entry| {
+        let marker = if !e.shadowed && active_ns == Some(e.name.as_str()) {
             "*"
         } else {
             " "
         };
-        out.push_str(&format!("{marker} {name}\n"));
+        let shadowed = if e.shadowed { " (shadowed)" } else { "" };
+        format!("{marker} {}{shadowed}\n", e.name)
+    };
+    let block = |level: &Level| {
+        let rows: String = entries
+            .iter()
+            .filter(|e| &e.level == level)
+            .map(row)
+            .collect();
+        if rows.is_empty() {
+            "  (no namespaces)\n".to_string()
+        } else {
+            rows
+        }
+    };
+    let mut out = String::new();
+    if levels.projects().is_empty() {
+        out.extend(entries.iter().map(row));
+    } else if !entries.is_empty() {
+        for project in levels.projects() {
+            out.push_str(&format!("project: {}\n", encode_path(project.dir())));
+            out.push_str(&block(&Level::Project {
+                dir: project.dir().to_path_buf(),
+            }));
+        }
+        out.push_str("user:\n");
+        out.push_str(&block(&Level::User));
     }
-    if let Some(ns) = &active.namespace
-        && !names.contains(ns)
+    if let Some(ns) = active_ns
+        && !entries.iter().any(|e| e.name == ns)
     {
         out.push_str(&format!("* {ns} (no longer exists)\n"));
     }
@@ -201,19 +236,33 @@ pub fn status(cfg: &Config, active: &ActiveState) -> Result<String> {
     Ok(out)
 }
 
-/// Shows the variables of namespace `ns`: its link group, and per variable
-/// the name and its value: a plain value quoted and escaped, a secret as the
-/// bare marker `@keychain` (never its value). Reads only the namespace
-/// file: it takes no `SecretStore`, so a secret value can never be fetched,
-/// let alone printed. Plain values are quoted and escaped
-/// ([`quote_for_display`]) so they cannot disturb the terminal or the layout.
-pub fn list_vars(cfg: &Config, ns: &str, active: &ActiveState) -> Result<String> {
+/// Shows the variables of namespace `ns`, resolved as `envy <ns>` would
+/// resolve it (`force_user` is `--user`): where it comes from, its link
+/// group, and per variable the name and its value: a plain value quoted and
+/// escaped, a secret as the bare marker `@keychain` (never its value). Reads
+/// only the namespace file: it takes no `SecretStore`, so a secret value can
+/// never be fetched, let alone printed. Plain values are quoted and escaped
+/// ([`quote_for_display`]) so they cannot disturb the terminal or the layout;
+/// a project file's path is percent-encoded for the same reason.
+pub fn list_vars(
+    levels: &Levels,
+    ns: &str,
+    force_user: bool,
+    active: &ActiveState,
+) -> Result<String> {
+    let cfg = levels.resolve(ns, force_user)?.cfg;
     let file = cfg.load(ns)?;
     let mut out = format!("namespace: {ns}");
     if active.namespace.as_deref() == Some(ns) {
         out.push_str(" (active)");
     }
     out.push('\n');
+    if cfg.is_project() {
+        let path = encode_path(&cfg.dir().join(format!("{ns}.toml")));
+        out.push_str(&format!("source: project ({path})\n"));
+    } else {
+        out.push_str("source: user\n");
+    }
     if let Some(group) = file.link() {
         out.push_str(&format!("link: {group}\n"));
     }
@@ -747,7 +796,11 @@ fn check_inline_plain(name: &str, value: &str) -> Result<()> {
 /// something fails midway the file is still there, still lists the secrets,
 /// and running the command again finishes the job (deleting an item that is
 /// already gone is fine).
-pub fn remove(ctx: &Ctx, ns: &str) -> Result<()> {
+///
+/// Returns the names of the secrets whose Keychain items were kept (at
+/// project level, when the user kept them), so the caller can say so; empty
+/// otherwise.
+pub fn remove(ctx: &Ctx, ns: &str) -> Result<Vec<String>> {
     let file = ctx.cfg.load(ns)?;
     let secrets: Vec<String> = file
         .vars()
@@ -798,7 +851,8 @@ pub fn remove(ctx: &Ctx, ns: &str) -> Result<()> {
             })?;
         }
     }
-    ctx.cfg.delete(ns)
+    ctx.cfg.delete(ns)?;
+    Ok(if delete_items { Vec::new() } else { secrets })
 }
 
 /// Opens namespace `ns` in an editor and saves what the user wrote, with
@@ -940,6 +994,8 @@ fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::levels::Levels;
+    use crate::project::encode_path;
     use crate::prompt::{Asked, ScriptedPrompter};
     use crate::store::MemoryStore;
 
@@ -950,6 +1006,136 @@ mod tests {
         }
         let cfg = Config::new(dir.path().to_path_buf());
         (dir, cfg)
+    }
+
+    /// The levels of a run outside any project: the user level only.
+    fn user_levels(cfg: &Config) -> Levels {
+        Levels::user_only(cfg.clone())
+    }
+
+    /// A temp home with a user level and two nested project levels:
+    /// `home/a/.envy` (ci, dev) and `home/a/b/.envy` (dev, web); the user
+    /// level has dev and mine. Returns the levels seen from `home/a/b`.
+    fn nested_levels() -> (tempfile::TempDir, std::path::PathBuf, Levels) {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().canonicalize().unwrap();
+        let home = base.join("home");
+        let user = base.join("user");
+        for (dir, names) in [
+            (home.join("a/.envy"), &["ci", "dev"][..]),
+            (home.join("a/b/.envy"), &["dev", "web"]),
+            (user.clone(), &["dev", "mine"]),
+        ] {
+            std::fs::create_dir_all(&dir).unwrap();
+            for n in names {
+                std::fs::write(dir.join(format!("{n}.toml")), "[vars]\nA = \"1\"\n").unwrap();
+            }
+        }
+        let levels = Levels::discover(&home.join("a/b"), &home, Config::new(user)).unwrap();
+        (tmp, home, levels)
+    }
+
+    fn active(ns: &str) -> ActiveState {
+        ActiveState {
+            namespace: Some(ns.into()),
+            vars: vec!["A".into()],
+        }
+    }
+
+    #[test]
+    fn status_lists_every_level_nearest_first_and_marks_shadowed() {
+        let (_tmp, home, levels) = nested_levels();
+        let inner = encode_path(&home.join("a/b/.envy"));
+        let outer = encode_path(&home.join("a/.envy"));
+        let body = |dev: &str, mine: &str| {
+            format!(
+                "project: {inner}\n{dev} dev\n  web\nproject: {outer}\n  ci\n  dev (shadowed)\n\
+                 user:\n  dev (shadowed)\n{mine} mine\n"
+            )
+        };
+        assert_eq!(
+            status(&levels, &ActiveState::default()).unwrap(),
+            body(" ", " ")
+        );
+        // The active name is marked once: on the row that provides it.
+        assert_eq!(status(&levels, &active("dev")).unwrap(), body("*", " "));
+        assert_eq!(status(&levels, &active("mine")).unwrap(), body(" ", "*"));
+        assert_eq!(
+            status(&levels, &active("gone")).unwrap(),
+            format!("{}* gone (no longer exists)\n", body(" ", " "))
+        );
+    }
+
+    #[test]
+    fn status_shows_an_empty_level_and_keeps_the_empty_state_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().canonicalize().unwrap();
+        let home = base.join("home");
+        let user = base.join("user");
+        std::fs::create_dir_all(home.join("p/.envy")).unwrap();
+        std::fs::create_dir_all(&user).unwrap();
+        let levels = Levels::discover(&home.join("p"), &home, Config::new(user.clone())).unwrap();
+        // Nothing anywhere: today's line.
+        assert_eq!(
+            status(&levels, &ActiveState::default()).unwrap(),
+            "no namespaces yet; create one with: envy <name> --new\n"
+        );
+        std::fs::write(user.join("mine.toml"), "").unwrap();
+        let envy = encode_path(&home.join("p/.envy"));
+        assert_eq!(
+            status(&levels, &ActiveState::default()).unwrap(),
+            format!("project: {envy}\n  (no namespaces)\nuser:\n  mine\n")
+        );
+    }
+
+    #[test]
+    fn status_header_escapes_the_project_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().canonicalize().unwrap();
+        let home = base.join("home");
+        let user = base.join("user");
+        let proj = home.join("evil\u{1b}[31m\nname");
+        std::fs::create_dir_all(proj.join(".envy")).unwrap();
+        std::fs::create_dir_all(&user).unwrap();
+        std::fs::write(proj.join(".envy/dev.toml"), "").unwrap();
+        let levels = Levels::discover(&proj, &home, Config::new(user)).unwrap();
+        let out = status(&levels, &ActiveState::default()).unwrap();
+        assert!(out.contains("evil%1B%5B31m%0Aname/.envy\n"), "{out}");
+        assert!(!out.chars().any(|c| c.is_control() && c != '\n'), "{out}");
+        assert_eq!(out.lines().count(), 4, "{out}");
+    }
+
+    #[test]
+    fn list_vars_shows_the_source_line() {
+        let (_tmp, home, levels) = nested_levels();
+        let file = encode_path(&home.join("a/b/.envy/dev.toml"));
+        assert_eq!(
+            list_vars(&levels, "dev", false, &active("dev")).unwrap(),
+            format!("namespace: dev (active)\nsource: project ({file})\n\nA  \"1\"\n")
+        );
+        // The outer level's own name, found walking up.
+        let ci = encode_path(&home.join("a/.envy/ci.toml"));
+        assert_eq!(
+            list_vars(&levels, "ci", false, &ActiveState::default()).unwrap(),
+            format!("namespace: ci\nsource: project ({ci})\n\nA  \"1\"\n")
+        );
+        // --user skips the project levels.
+        assert_eq!(
+            list_vars(&levels, "dev", true, &ActiveState::default()).unwrap(),
+            "namespace: dev\nsource: user\n\nA  \"1\"\n"
+        );
+        assert!(list_vars(&levels, "ci", true, &ActiveState::default()).is_err());
+    }
+
+    #[test]
+    fn list_vars_of_a_corrupt_project_file_fails_closed() {
+        let (_tmp, home, levels) = nested_levels();
+        std::fs::write(home.join("a/b/.envy/dev.toml"), "not [toml").unwrap();
+        let err = format!(
+            "{:#}",
+            list_vars(&levels, "dev", false, &ActiveState::default()).unwrap_err()
+        );
+        assert!(err.contains("invalid TOML"), "{err}");
     }
 
     #[test]
@@ -965,7 +1151,7 @@ mod tests {
             namespace: Some("work".into()),
             vars: vec!["A".into(), "B".into()],
         };
-        let out = status(&cfg, &active).unwrap();
+        let out = status(&user_levels(&cfg), &active).unwrap();
         assert_eq!(out, "  personal\n* work\n");
         assert!(!out.contains("value"));
     }
@@ -980,10 +1166,10 @@ mod tests {
             "dev",
             "[vars]\nAWS_REGION = \"eu-west-1\"\nLOG = \"debug\"\n",
         )]);
-        let out = list_vars(&cfg, "dev", &ActiveState::default()).unwrap();
+        let out = list_vars(&user_levels(&cfg), "dev", false, &ActiveState::default()).unwrap();
         assert_eq!(
             out,
-            "namespace: dev\n\nAWS_REGION  \"eu-west-1\"\nLOG         \"debug\"\n"
+            "namespace: dev\nsource: user\n\nAWS_REGION  \"eu-west-1\"\nLOG         \"debug\"\n"
         );
     }
 
@@ -995,18 +1181,18 @@ mod tests {
         )]);
         // `list_vars` takes only a Config and an ActiveState: there is no
         // store to read from, by construction.
-        let out = list_vars(&cfg, "dev", &ActiveState::default()).unwrap();
+        let out = list_vars(&user_levels(&cfg), "dev", false, &ActiveState::default()).unwrap();
         assert_eq!(
             out,
-            "namespace: dev\n\nTOKEN   @keychain\nREGION  \"eu\"\nB       @keychain\n"
+            "namespace: dev\nsource: user\n\nTOKEN   @keychain\nREGION  \"eu\"\nB       @keychain\n"
         );
     }
 
     #[test]
     fn list_vars_shows_the_link_group() {
         let (_dir, cfg) = config_with(&[("dev", "link = \"aws\"\n[vars]\nA = \"1\"\n")]);
-        let out = list_vars(&cfg, "dev", &ActiveState::default()).unwrap();
-        assert_eq!(out, "namespace: dev\nlink: aws\n\nA  \"1\"\n");
+        let out = list_vars(&user_levels(&cfg), "dev", false, &ActiveState::default()).unwrap();
+        assert_eq!(out, "namespace: dev\nsource: user\nlink: aws\n\nA  \"1\"\n");
     }
 
     #[test]
@@ -1020,12 +1206,12 @@ mod tests {
             vars: vec!["A".into()],
         };
         assert_eq!(
-            list_vars(&cfg, "dev", &active).unwrap(),
-            "namespace: dev (active)\nlink: aws\n\nA  \"1\"\n"
+            list_vars(&user_levels(&cfg), "dev", false, &active).unwrap(),
+            "namespace: dev (active)\nsource: user\nlink: aws\n\nA  \"1\"\n"
         );
         assert_eq!(
-            list_vars(&cfg, "prod", &active).unwrap(),
-            "namespace: prod\n\nA  \"2\"\n"
+            list_vars(&user_levels(&cfg), "prod", false, &active).unwrap(),
+            "namespace: prod\nsource: user\n\nA  \"2\"\n"
         );
     }
 
@@ -1033,12 +1219,12 @@ mod tests {
     fn list_vars_on_an_empty_namespace_says_so() {
         let (_dir, cfg) = config_with(&[("dev", ""), ("lk", "link = \"g\"\n")]);
         assert_eq!(
-            list_vars(&cfg, "dev", &ActiveState::default()).unwrap(),
-            "namespace: dev\n\n(no variables)\n"
+            list_vars(&user_levels(&cfg), "dev", false, &ActiveState::default()).unwrap(),
+            "namespace: dev\nsource: user\n\n(no variables)\n"
         );
         assert_eq!(
-            list_vars(&cfg, "lk", &ActiveState::default()).unwrap(),
-            "namespace: lk\nlink: g\n\n(no variables)\n"
+            list_vars(&user_levels(&cfg), "lk", false, &ActiveState::default()).unwrap(),
+            "namespace: lk\nsource: user\nlink: g\n\n(no variables)\n"
         );
     }
 
@@ -1048,16 +1234,16 @@ mod tests {
             "dev",
             "[vars]\nA = \"x\\ny\\u001b[31mred\\tt \\\"q\\\" back\\\\slash caf\u{e9} \u{65e5}\u{672c}\\u007f\\u202e\\r\"\nE = \"\"\nB = \"ok\"\n",
         )]);
-        let out = list_vars(&cfg, "dev", &ActiveState::default()).unwrap();
+        let out = list_vars(&user_levels(&cfg), "dev", false, &ActiveState::default()).unwrap();
         assert_eq!(
             out,
-            "namespace: dev\n\n\
+            "namespace: dev\nsource: user\n\n\
              A  \"x\\ny\\u{1b}[31mred\\tt \\\"q\\\" back\\\\slash caf\u{e9} \u{65e5}\u{672c}\\u{7f}\\u{202e}\\r\"\n\
              E  \"\"\n\
              B  \"ok\"\n"
         );
         // One row per variable, and no raw control character anywhere.
-        assert_eq!(rows(&out).len(), 5);
+        assert_eq!(rows(&out).len(), 6);
         assert!(!out.chars().any(|c| c.is_control() && c != '\n'));
     }
 
@@ -1115,28 +1301,29 @@ mod tests {
             "dev",
             "[vars]\nA = \"a\\U000E0041b\\u061c\\u00ad\\ufe0f\"\n",
         )]);
-        let out = list_vars(&cfg, "dev", &ActiveState::default()).unwrap();
+        let out = list_vars(&user_levels(&cfg), "dev", false, &ActiveState::default()).unwrap();
         assert_eq!(
             out,
-            "namespace: dev\n\nA  \"a\\u{e0041}b\\u{61c}\\u{ad}\\u{fe0f}\"\n"
+            "namespace: dev\nsource: user\n\nA  \"a\\u{e0041}b\\u{61c}\\u{ad}\\u{fe0f}\"\n"
         );
     }
 
     #[test]
     fn list_vars_unknown_namespace_gives_the_new_hint() {
         let (_dir, cfg) = config_with(&[]);
-        let err = list_vars(&cfg, "nope", &ActiveState::default()).unwrap_err();
+        let err =
+            list_vars(&user_levels(&cfg), "nope", false, &ActiveState::default()).unwrap_err();
         assert_eq!(
             format!("{err:#}"),
             "namespace \"nope\" does not exist (use --new to create it)"
         );
-        assert!(list_vars(&cfg, "../x", &ActiveState::default()).is_err());
+        assert!(list_vars(&user_levels(&cfg), "../x", false, &ActiveState::default()).is_err());
     }
 
     #[test]
     fn list_vars_corrupt_file_names_the_file_but_not_its_contents() {
         let (_dir, cfg) = config_with(&[("dev", "[vars\nA = \"zq-secretish\"\n")]);
-        let err = list_vars(&cfg, "dev", &ActiveState::default()).unwrap_err();
+        let err = list_vars(&user_levels(&cfg), "dev", false, &ActiveState::default()).unwrap_err();
         let msg = format!("{err:#} {err:?}");
         assert!(
             msg.contains("\"dev\"") && msg.contains("invalid TOML"),
@@ -1148,9 +1335,12 @@ mod tests {
     #[test]
     fn status_without_active_marks_nothing_and_handles_empty_dir() {
         let (_dir, cfg) = config_with(&[("work", "")]);
-        assert_eq!(status(&cfg, &ActiveState::default()).unwrap(), "  work\n");
+        assert_eq!(
+            status(&user_levels(&cfg), &ActiveState::default()).unwrap(),
+            "  work\n"
+        );
         let (_dir, empty) = config_with(&[]);
-        let out = status(&empty, &ActiveState::default()).unwrap();
+        let out = status(&user_levels(&empty), &ActiveState::default()).unwrap();
         assert!(out.contains("--new"), "{out}");
     }
 
@@ -1162,7 +1352,7 @@ mod tests {
             vars: vec![],
         };
         assert_eq!(
-            status(&cfg, &active).unwrap(),
+            status(&user_levels(&cfg), &active).unwrap(),
             "  work\n* gone (no longer exists)\n"
         );
     }
@@ -2210,7 +2400,7 @@ mod tests {
             store: &store,
             prompt: &prompt,
         };
-        remove(&ctx, "work").unwrap();
+        assert!(remove(&ctx, "work").unwrap().is_empty());
         assert_eq!(file_names(&dir), vec!["other.toml"]);
         assert_eq!(snap(&store), vec![entry("other", "T1", "keep")]);
     }
@@ -3849,7 +4039,8 @@ mod tests {
         let prompt = ScriptedPrompter::new()
             .with_confirm(true)
             .with_confirm(false);
-        remove(&ctx_of(&cfg, &store, &prompt), "dev").unwrap();
+        let kept = remove(&ctx_of(&cfg, &store, &prompt), "dev").unwrap();
+        assert_eq!(kept, vec!["TOKEN", "API_KEY"]);
         assert!(!cfg.exists("dev").unwrap());
         assert_eq!(store.snapshot(), before);
         assert_eq!(prompt.asked().len(), 2);
@@ -3864,7 +4055,8 @@ mod tests {
         let prompt = ScriptedPrompter::new()
             .with_confirm(true)
             .with_confirm(true);
-        remove(&ctx_of(&cfg, &store, &prompt), "dev").unwrap();
+        let kept = remove(&ctx_of(&cfg, &store, &prompt), "dev").unwrap();
+        assert!(kept.is_empty(), "{kept:?}");
         assert!(!cfg.exists("dev").unwrap());
         assert_eq!(
             store.snapshot(),
@@ -3900,7 +4092,8 @@ mod tests {
         let store = rm_store();
         let before = store.snapshot();
         let prompt = ScriptedPrompter::new().with_confirm(true);
-        remove(&ctx_of(&cfg, &store, &prompt), "dev").unwrap();
+        let kept = remove(&ctx_of(&cfg, &store, &prompt), "dev").unwrap();
+        assert!(kept.is_empty(), "{kept:?}");
         assert!(!cfg.exists("dev").unwrap());
         assert_eq!(store.snapshot(), before);
         assert_eq!(prompt.asked().len(), 1);
@@ -3911,7 +4104,8 @@ mod tests {
         let (dir, cfg) = config_with(&[("dev", RM)]);
         let store = rm_store();
         let prompt = ScriptedPrompter::new().with_confirm(true);
-        remove(&ctx_of(&cfg, &store, &prompt), "dev").unwrap();
+        let kept = remove(&ctx_of(&cfg, &store, &prompt), "dev").unwrap();
+        assert!(kept.is_empty(), "{kept:?}");
         assert!(file_names(&dir).is_empty());
         assert_eq!(
             store.snapshot(),

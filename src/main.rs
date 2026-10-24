@@ -1,15 +1,18 @@
 use std::ffi::{OsStr, OsString};
 use std::io::{IsTerminal, Write};
+use std::path::PathBuf;
 use std::process::ExitCode;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use envy::activate::{ActiveState, render_off};
 use envy::cli::{self, Action, Command, Scope};
 use envy::commands::{self, Ctx};
 use envy::config::Config;
 use envy::editor;
 use envy::init;
+use envy::levels::{Levels, shadow_note};
 use envy::link;
+use envy::project::encode_path;
 use envy::prompt::TtyPrompter;
 use envy::store::MacKeychain;
 
@@ -52,99 +55,142 @@ fn active_state() -> ActiveState {
     ActiveState::from_env(|k| std::env::var(k).ok())
 }
 
+/// Where this run is: the current directory, the home directory (the
+/// boundary of the project search), and every level found from there.
+struct Here {
+    cwd: PathBuf,
+    home: PathBuf,
+    levels: Levels,
+}
+
+impl Here {
+    fn discover() -> Result<Here> {
+        let home = match std::env::var_os("HOME") {
+            Some(h) if !h.is_empty() => PathBuf::from(h),
+            _ => bail!(
+                "HOME is not set; envy needs it to know where to stop looking for a project's .envy folder"
+            ),
+        };
+        let cwd = std::env::current_dir().context("cannot read the current directory")?;
+        let levels = Levels::discover(&cwd, &home, Config::from_env()?)?;
+        Ok(Here { cwd, home, levels })
+    }
+
+    /// The level `ns` resolves to (`--user` forces the user's own), with the
+    /// shadow note on stderr when a project namespace hides a user one.
+    fn resolve(&self, ns: &str, scope: Scope) -> Result<&Config> {
+        let resolved = self.levels.resolve(ns, scope == Scope::User)?;
+        if resolved.shadows_user {
+            eprintln!("{}", shadow_note(ns));
+        }
+        Ok(resolved.cfg)
+    }
+}
+
+fn ctx(cfg: &Config) -> Ctx<'_> {
+    Ctx {
+        cfg,
+        store: &MacKeychain,
+        prompt: &TtyPrompter,
+    }
+}
+
 /// Runs the action and returns the text for stdout. The text of an activation
 /// contains secrets: it is only ever written to stdout, never logged.
-fn run(action: Action) -> Result<String> {
-    match action {
-        Action::Status => commands::status(&Config::from_env()?, &active_state()),
-        Action::Activate(ns) => {
-            // Refuse before the config or the Keychain is read.
-            check_emit()?;
-            let cfg = Config::from_env()?;
-            let ctx = Ctx {
-                cfg: &cfg,
-                store: &MacKeychain,
-                prompt: &TtyPrompter,
-            };
-            commands::activate(&ctx, &ns, &active_state())
-        }
+fn run(command: Command) -> Result<String> {
+    let scope = command.scope;
+    match command.action {
+        Action::Init(_) => Ok(init::zsh_function().to_string()),
         Action::Off => {
             check_emit()?;
             Ok(render_off(&active_state()))
         }
-        Action::List(ns) => commands::list_vars(&Config::from_env()?, &ns, &active_state()),
-        Action::Init(_) => Ok(init::zsh_function().to_string()),
+        Action::Activate(ns) => {
+            // Refuse before the config, the Keychain or the filesystem is read.
+            check_emit()?;
+            let here = Here::discover()?;
+            let cfg = here.resolve(&ns, scope)?;
+            commands::activate(&ctx(cfg), &ns, &active_state())
+        }
+        Action::Status => commands::status(&Here::discover()?.levels, &active_state()),
+        Action::List(ns) => {
+            let here = Here::discover()?;
+            // For the note only: `list_vars` resolves the same way.
+            here.resolve(&ns, scope)?;
+            commands::list_vars(&here.levels, &ns, scope == Scope::User, &active_state())
+        }
         Action::New { ns, like, link } => {
-            let cfg = Config::from_env()?;
-            let ctx = Ctx {
-                cfg: &cfg,
-                store: &MacKeychain,
-                prompt: &TtyPrompter,
+            let here = Here::discover()?;
+            let new_level;
+            let target = match scope {
+                Scope::Auto => here.levels.creation_level(false),
+                Scope::User => here.levels.creation_level(true),
+                Scope::Project => {
+                    new_level =
+                        Levels::new_project_level(&here.cwd, &here.home, here.levels.user())?;
+                    &new_level
+                }
             };
-            let source = like.map(|n| cfg.load(&n)).transpose()?;
+            // The source resolves like any other name, at its own level, and
+            // is loaded before anything is created.
+            let source = match &like {
+                Some(name) => {
+                    let cfg = here.resolve(name, scope)?;
+                    Some((cfg, cfg.load(name)?))
+                }
+                None => None,
+            };
             commands::create(
-                &ctx,
+                &ctx(target),
                 &ns,
-                source.as_ref().map(|f| (&cfg, f)),
+                source.as_ref().map(|(cfg, file)| (*cfg, file)),
                 link.as_deref(),
             )?;
-            eprintln!("created namespace {ns:?}");
+            if target.is_project() {
+                eprintln!(
+                    "created project namespace {ns:?} in {}",
+                    encode_path(target.dir())
+                );
+            } else {
+                eprintln!("created namespace {ns:?}");
+            }
             Ok(String::new())
         }
         Action::Set { ns, items } => {
-            let cfg = Config::from_env()?;
-            let ctx = Ctx {
-                cfg: &cfg,
-                store: &MacKeychain,
-                prompt: &TtyPrompter,
-            };
-            commands::set_vars(&ctx, &ns, &items)?;
+            let here = Here::discover()?;
+            commands::set_vars(&ctx(here.resolve(&ns, scope)?), &ns, &items)?;
             // Names only: never a value.
             let names: Vec<&str> = items.iter().map(|i| i.name.as_str()).collect();
             eprintln!("saved {} in {ns:?}", names.join(", "));
             Ok(String::new())
         }
         Action::Rm(ns) => {
-            let cfg = Config::from_env()?;
-            let ctx = Ctx {
-                cfg: &cfg,
-                store: &MacKeychain,
-                prompt: &TtyPrompter,
-            };
-            commands::remove(&ctx, &ns)?;
+            let here = Here::discover()?;
+            let kept = commands::remove(&ctx(here.resolve(&ns, scope)?), &ns)?;
             eprintln!("removed namespace {ns:?}");
+            if !kept.is_empty() {
+                eprintln!(
+                    "kept the project's shared Keychain items for: {} (delete them in Keychain Access: search \"envy.project/\")",
+                    kept.join(", ")
+                );
+            }
             Ok(String::new())
         }
         Action::Link { ns, group } => {
-            let cfg = Config::from_env()?;
-            let ctx = Ctx {
-                cfg: &cfg,
-                store: &MacKeychain,
-                prompt: &TtyPrompter,
-            };
-            link::link(&ctx, &ns, &group)?;
+            let here = Here::discover()?;
+            link::link(&ctx(here.resolve(&ns, scope)?), &ns, &group)?;
             eprintln!("linked {ns:?} to group {group:?}");
             Ok(String::new())
         }
         Action::Unlink(ns) => {
-            let cfg = Config::from_env()?;
-            let ctx = Ctx {
-                cfg: &cfg,
-                store: &MacKeychain,
-                prompt: &TtyPrompter,
-            };
-            link::unlink(&ctx, &ns)?;
+            let here = Here::discover()?;
+            link::unlink(&ctx(here.resolve(&ns, scope)?), &ns)?;
             eprintln!("unlinked {ns:?}; its variables are kept");
             Ok(String::new())
         }
         Action::Edit(ns) => {
-            let cfg = Config::from_env()?;
-            let ctx = Ctx {
-                cfg: &cfg,
-                store: &MacKeychain,
-                prompt: &TtyPrompter,
-            };
-            if commands::edit(&ctx, &ns, &editor::launch)? {
+            let here = Here::discover()?;
+            if commands::edit(&ctx(here.resolve(&ns, scope)?), &ns, &editor::launch)? {
                 eprintln!("saved {ns:?}");
             } else {
                 eprintln!("no changes");
@@ -152,14 +198,6 @@ fn run(action: Action) -> Result<String> {
             Ok(String::new())
         }
     }
-}
-
-/// Until the flags are wired in, refuse them instead of ignoring them.
-fn scope_guard(command: &Command) -> Result<()> {
-    if command.scope != Scope::Auto {
-        bail!("--user and --project are not available yet");
-    }
-    Ok(())
 }
 
 fn write_stdout(text: &str) -> std::io::Result<()> {
@@ -198,7 +236,7 @@ fn main() -> ExitCode {
             };
         }
     };
-    match scope_guard(&command).and_then(|()| run(command.action)) {
+    match run(command) {
         Ok(text) => match write_stdout(&text) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
@@ -236,19 +274,6 @@ mod tests {
                 err.contains("eval \"$(envy --init zsh)\""),
                 "{terminal} {marker:?}: {err}"
             );
-        }
-    }
-
-    #[test]
-    fn scope_flags_are_refused_until_they_are_wired() {
-        let cmd = |scope| Command {
-            action: Action::Activate("dev".into()),
-            scope,
-        };
-        assert!(scope_guard(&cmd(Scope::Auto)).is_ok());
-        for scope in [Scope::User, Scope::Project] {
-            let err = scope_guard(&cmd(scope)).unwrap_err().to_string();
-            assert!(err.contains("not available yet"), "{err}");
         }
     }
 

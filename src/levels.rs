@@ -79,6 +79,24 @@ impl Levels {
         Ok(Levels { projects, user })
     }
 
+    /// No project level: what [`Levels::discover`] finds outside any project.
+    pub fn user_only(user: Config) -> Levels {
+        Levels {
+            projects: Vec::new(),
+            user,
+        }
+    }
+
+    /// The user's own level.
+    pub fn user(&self) -> &Config {
+        &self.user
+    }
+
+    /// The project levels, nearest first.
+    pub fn projects(&self) -> &[Config] {
+        &self.projects
+    }
+
     /// The level that provides `ns`: the nearest project level with the file,
     /// else the user level (which is also the answer when no level has it, so
     /// `load` reports the usual "does not exist"). Only file existence is

@@ -357,7 +357,7 @@ impl Flags {
             );
         }
         if user && namespace.is_none() {
-            bail!("--user needs a namespace, and it comes first: envy <namespace> --user");
+            bail!("--user needs a namespace: envy <namespace> --user");
         }
         if project && !creating {
             bail!("--project only works with --new: envy <namespace> --new --project");
@@ -1124,6 +1124,21 @@ mod tests {
         for (args, mention) in cases {
             let err = error_text(args);
             assert!(err.contains(mention), "{args:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn user_without_a_namespace_shows_a_form_that_works() {
+        for args in [
+            &["--user"][..],
+            &["--user", "--list"],
+            &["--list", "--user"],
+        ] {
+            let msg = p(args).unwrap_err().to_string();
+            assert_eq!(
+                msg, "--user needs a namespace: envy <namespace> --user",
+                "{args:?}"
+            );
         }
     }
 
