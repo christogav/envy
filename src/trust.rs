@@ -162,8 +162,13 @@ impl TrustStore {
 /// which secrets it reads. `in_keychain` holds secret variable NAMES already in
 /// the Keychain; no value can reach this function. The text ends without a
 /// question mark: the prompter appends `[y/N]: `.
-pub fn confirmation_text(cfg: &Config, file: &NamespaceFile, in_keychain: &[String]) -> String {
-    confirmation_text_for(cfg, file, in_keychain, Purpose::Load)
+#[cfg(test)]
+pub(crate) fn confirmation_text(
+    cfg: &Config,
+    file: &NamespaceFile,
+    in_keychain: &[String],
+) -> String {
+    confirmation_text_for(cfg, file, in_keychain, Purpose::Load, false)
 }
 
 /// What the user is asked to allow with a project namespace file.
@@ -179,11 +184,18 @@ pub enum Purpose {
 }
 
 /// [`confirmation_text`] for a given purpose: only the closing line differs.
+///
+/// `new_checkout`: this checkout has never trusted the namespace. Then, when
+/// loading or changing, if some of its secrets already exist (saved for the
+/// same identity from another checkout), a caution line says to agree only if
+/// this folder really is that project: a copied folder with its own `.git`
+/// can claim any identity.
 pub fn confirmation_text_for(
     cfg: &Config,
     file: &NamespaceFile,
     in_keychain: &[String],
     purpose: Purpose,
+    new_checkout: bool,
 ) -> String {
     let ns = file.name();
     let mut out = match cfg.identity() {
@@ -213,6 +225,16 @@ pub fn confirmation_text_for(
                 out.push_str(&format!("secret {name}: you will be asked for it\n"));
             }
         }
+    }
+    if new_checkout
+        && !in_keychain.is_empty()
+        && purpose != Purpose::Copy
+        && let Some(id) = cfg.identity()
+    {
+        out.push_str(&format!(
+            "\nSome of these secrets were saved for {id} from another checkout; \
+             say yes only if this folder really is {id}.\n"
+        ));
     }
     out.push_str(match purpose {
         Purpose::Load => "\nAllow envy to load these variables into your current shell",
@@ -411,8 +433,8 @@ mod tests {
     fn confirmation_closing_line_names_the_purpose() {
         let (_root, _user, cfg) = project_cfg(&[("dev", "[vars]\nA = \"1\"\n")], "acme/api");
         let file = cfg.load("dev").unwrap();
-        let load = confirmation_text_for(&cfg, &file, &[], Purpose::Load);
-        let copy = confirmation_text_for(&cfg, &file, &[], Purpose::Copy);
+        let load = confirmation_text_for(&cfg, &file, &[], Purpose::Load, false);
+        let copy = confirmation_text_for(&cfg, &file, &[], Purpose::Copy, false);
         assert_eq!(load, confirmation_text(&cfg, &file, &[]));
         assert!(load.ends_with("\n\nAllow envy to load these variables into your current shell"));
         assert!(
@@ -425,7 +447,7 @@ mod tests {
             load.rsplit_once("\n\n").unwrap().0,
             copy.rsplit_once("\n\n").unwrap().0
         );
-        let change = confirmation_text_for(&cfg, &file, &[], Purpose::Change);
+        let change = confirmation_text_for(&cfg, &file, &[], Purpose::Change, false);
         assert_eq!(
             change.rsplit_once("\n\n").unwrap(),
             (
@@ -624,5 +646,50 @@ mod tests {
                 .unwrap()
         );
         assert_eq!(fs::read_dir(user.path().join("trust")).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn a_new_checkout_with_existing_secrets_gets_a_caution_line() {
+        let (_root, _user, cfg) = project_cfg(
+            &[(
+                "dev",
+                "[vars]\nAPI_TOKEN = \"@keychain\"\nDB_PASS = \"@keychain\"\n",
+            )],
+            "acme/api",
+        );
+        let file = cfg.load("dev").unwrap();
+        let have = ["API_TOKEN".to_string()];
+        let text = confirmation_text_for(&cfg, &file, &have, Purpose::Load, true);
+        let expected = format!(
+            "Project namespace \"dev\" from acme/api\n\
+             file: {}\n\
+             \n\
+             API_TOKEN  @keychain\n\
+             DB_PASS    @keychain\n\
+             secret API_TOKEN: already in your Keychain\n\
+             secret DB_PASS: you will be asked for it\n\
+             \n\
+             Some of these secrets were saved for acme/api from another checkout; say yes only if this folder really is acme/api.\n\
+             \n\
+             Allow envy to load these variables into your current shell",
+            encode_path(&cfg.dir().join("dev.toml"))
+        );
+        assert_eq!(text, expected);
+        let caution = "Some of these secrets were saved for acme/api";
+        let change = confirmation_text_for(&cfg, &file, &have, Purpose::Change, true);
+        assert!(change.contains(caution), "{change}");
+        // Not when copying, not when nothing exists yet, not when this
+        // checkout trusted the file before (it changed since).
+        for text in [
+            confirmation_text_for(&cfg, &file, &have, Purpose::Copy, true),
+            confirmation_text_for(&cfg, &file, &[], Purpose::Load, true),
+            confirmation_text_for(&cfg, &file, &have, Purpose::Load, false),
+        ] {
+            assert!(!text.contains(caution), "{text}");
+        }
+        assert_eq!(
+            confirmation_text_for(&cfg, &file, &have, Purpose::Load, false),
+            confirmation_text(&cfg, &file, &have)
+        );
     }
 }

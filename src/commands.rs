@@ -42,7 +42,8 @@ pub fn activate(ctx: &Ctx, ns: &str, prev: &ActiveState) -> Result<String> {
     let display_ns = display_ns(ctx.cfg, ns);
     let mut secrets: Vec<(String, Secret)> = Vec::new();
     for (name, value) in file.vars() {
-        if value != Value::Secret || ctx.store.get(&key, &name)?.is_some() {
+        // Existence only: no value is read before the render.
+        if value != Value::Secret || ctx.store.contains(&key, &name)? {
             continue;
         }
         let secret = ctx
@@ -103,16 +104,24 @@ pub(crate) fn check_trust_for(ctx: &Ctx, file: &NamespaceFile, purpose: Purpose)
     let key = ctx.cfg.secret_key(ns);
     let mut in_keychain: Vec<String> = Vec::new();
     for (name, value) in file.vars() {
-        // Existence only: the value is dropped unread.
-        if value == Value::Secret && ctx.store.get(&key, &name)?.is_some() {
+        // Existence only, before the user has agreed to anything: no value
+        // is read (on the real Keychain, no access dialog).
+        if value == Value::Secret && ctx.store.contains(&key, &name)? {
             in_keychain.push(name);
         }
     }
     let mut question = String::new();
-    if trust.previously_trusted(root, ns)? {
+    let seen_here = trust.previously_trusted(root, ns)?;
+    if seen_here {
         question.push_str("Note: this namespace file has changed since you last trusted it.\n\n");
     }
-    question.push_str(&confirmation_text_for(ctx.cfg, file, &in_keychain, purpose));
+    question.push_str(&confirmation_text_for(
+        ctx.cfg,
+        file,
+        &in_keychain,
+        purpose,
+        !seen_here,
+    ));
     let (hint, nothing) = match purpose {
         Purpose::Load => (
             format!("run envy {ns} in a terminal"),
@@ -1680,6 +1689,9 @@ mod tests {
         fn get(&self, ns: &str, name: &str) -> Result<Option<Secret>> {
             self.inner.get(ns, name)
         }
+        fn contains(&self, ns: &str, name: &str) -> Result<bool> {
+            self.inner.contains(ns, name)
+        }
         fn set(&self, ns: &str, name: &str, value: &Secret) -> Result<()> {
             if name == self.fail_on {
                 bail!("simulated Keychain failure");
@@ -2077,6 +2089,9 @@ mod tests {
     impl SecretStore for SquatOnSet {
         fn get(&self, ns: &str, name: &str) -> Result<Option<Secret>> {
             self.inner.get(ns, name)
+        }
+        fn contains(&self, ns: &str, name: &str) -> Result<bool> {
+            self.inner.contains(ns, name)
         }
         fn set(&self, ns: &str, name: &str, value: &Secret) -> Result<()> {
             self.inner.set(ns, name, value)?;
@@ -4529,6 +4544,9 @@ mod tests {
         fn get(&self, ns: &str, name: &str) -> Result<Option<Secret>> {
             self.inner.get(ns, name)
         }
+        fn contains(&self, ns: &str, name: &str) -> Result<bool> {
+            self.inner.contains(ns, name)
+        }
         fn set(&self, ns: &str, name: &str, value: &Secret) -> Result<()> {
             self.inner.set(ns, name, value)
         }
@@ -5047,5 +5065,110 @@ mod tests {
         set_vars(&ctx, "work", &[pv("envy_x", "1")]).unwrap();
         let out = activate(&ctx, "work", &ActiveState::default()).unwrap();
         assert!(out.ends_with("export envy_x='1'\n"), "{out}");
+    }
+
+    /// A store whose `get` (which reads a secret VALUE, and on the real
+    /// Keychain may show macOS's access dialog) must not be called.
+    struct NoReads(MemoryStore);
+
+    impl SecretStore for NoReads {
+        fn get(&self, _: &str, _: &str) -> Result<Option<Secret>> {
+            panic!("a secret value was read before the user consented")
+        }
+        fn contains(&self, ns: &str, name: &str) -> Result<bool> {
+            self.0.contains(ns, name)
+        }
+        fn set(&self, ns: &str, name: &str, value: &Secret) -> Result<()> {
+            self.0.set(ns, name, value)
+        }
+        fn delete(&self, ns: &str, name: &str) -> Result<()> {
+            self.0.delete(ns, name)
+        }
+    }
+
+    #[test]
+    fn the_confirmation_checks_existence_without_reading_values() {
+        let base = tempfile::tempdir().unwrap();
+        let cfg = checkout(base.path(), "a", PROJ);
+        let store = NoReads(MemoryStore::default());
+        store
+            .0
+            .set(PKEY, "TOKEN", &Secret::new("t".into()))
+            .unwrap();
+        let prompt = ScriptedPrompter::new().with_confirm(false);
+        let ctx = Ctx {
+            cfg: &cfg,
+            store: &store,
+            prompt: &prompt,
+        };
+        assert!(activate(&ctx, "dev", &ActiveState::default()).is_err());
+        let Asked::Confirm(q) = &prompt.asked()[0] else {
+            panic!()
+        };
+        assert!(q.contains("secret TOKEN: already in your Keychain"), "{q}");
+        assert!(
+            q.contains("secret API_KEY: you will be asked for it"),
+            "{q}"
+        );
+        // The caution: TOKEN was saved from another checkout.
+        assert!(
+            q.contains("Some of these secrets were saved for acme/api from another checkout"),
+            "{q}"
+        );
+    }
+
+    #[test]
+    fn the_missing_secret_scan_reads_no_values() {
+        let base = tempfile::tempdir().unwrap();
+        let cfg = checkout(base.path(), "a", PROJ);
+        assert!(!trusted(&cfg, PROJ));
+        crate::trust::TrustStore::new(cfg.user_dir())
+            .record(cfg.root().unwrap(), "dev", &cfg.load("dev").unwrap().text())
+            .unwrap();
+        let store = NoReads(MemoryStore::default());
+        store
+            .0
+            .set(PKEY, "TOKEN", &Secret::new("t".into()))
+            .unwrap();
+        // No answer for API_KEY: the command stops at that prompt.
+        let prompt = ScriptedPrompter::new();
+        let ctx = Ctx {
+            cfg: &cfg,
+            store: &store,
+            prompt: &prompt,
+        };
+        assert!(activate(&ctx, "dev", &ActiveState::default()).is_err());
+        assert_eq!(
+            prompt.asked(),
+            vec![Asked::Secret(secret_label(
+                "API_KEY",
+                "dev (project acme/api)"
+            ))]
+        );
+    }
+
+    #[test]
+    fn a_changed_file_at_the_same_checkout_gets_no_caution() {
+        let base = tempfile::tempdir().unwrap();
+        let cfg = checkout(base.path(), "a", PROJ);
+        crate::trust::TrustStore::new(cfg.user_dir())
+            .record(cfg.root().unwrap(), "dev", "old text")
+            .unwrap();
+        let store = MemoryStore::default();
+        store.set(PKEY, "TOKEN", &Secret::new("t".into())).unwrap();
+        let prompt = ScriptedPrompter::new().with_confirm(false);
+        assert!(
+            activate(
+                &ctx_of(&cfg, &store, &prompt),
+                "dev",
+                &ActiveState::default()
+            )
+            .is_err()
+        );
+        let Asked::Confirm(q) = &prompt.asked()[0] else {
+            panic!()
+        };
+        assert!(q.contains("has changed since you last trusted it"), "{q}");
+        assert!(!q.contains("from another checkout"), "{q}");
     }
 }

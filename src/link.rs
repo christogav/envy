@@ -1295,6 +1295,9 @@ mod tests {
         fn get(&self, ns: &str, name: &str) -> Result<Option<Secret>> {
             self.inner.get(ns, name)
         }
+        fn contains(&self, ns: &str, name: &str) -> Result<bool> {
+            self.inner.contains(ns, name)
+        }
         fn set(&self, ns: &str, name: &str, value: &Secret) -> Result<()> {
             self.calls.set(self.calls.get() + 1);
             if self.calls.get() == self.n {
@@ -1373,6 +1376,9 @@ mod tests {
         fn get(&self, ns: &str, name: &str) -> Result<Option<Secret>> {
             self.inner.get(ns, name)
         }
+        fn contains(&self, ns: &str, name: &str) -> Result<bool> {
+            self.inner.contains(ns, name)
+        }
         fn set(&self, ns: &str, name: &str, value: &Secret) -> Result<()> {
             self.inner.set(ns, name, value)?;
             if (ns, name) == (self.ns, self.name) && self.path.is_file() {
@@ -1435,6 +1441,9 @@ mod tests {
     impl SecretStore for FailingDelete {
         fn get(&self, ns: &str, name: &str) -> Result<Option<Secret>> {
             self.0.get(ns, name)
+        }
+        fn contains(&self, ns: &str, name: &str) -> Result<bool> {
+            self.0.contains(ns, name)
         }
         fn set(&self, ns: &str, name: &str, value: &Secret) -> Result<()> {
             self.0.set(ns, name, value)

@@ -10,7 +10,12 @@ use crate::secret::Secret;
 /// for a project namespace; the Keychain service becomes `envy.{key}`, e.g.
 /// `envy.project/acme/api/dev`.
 pub trait SecretStore {
+    /// Reads a secret VALUE. On the real Keychain this may make macOS ask
+    /// the user to allow access, so call it only once the user has agreed to
+    /// what envy is doing; use [`SecretStore::contains`] before that.
     fn get(&self, ns: &str, name: &str) -> Result<Option<Secret>>;
+    /// Whether the item exists, without reading its value.
+    fn contains(&self, ns: &str, name: &str) -> Result<bool>;
     fn set(&self, ns: &str, name: &str, value: &Secret) -> Result<()>;
     /// Deleting an item that does not exist is not an error.
     fn delete(&self, ns: &str, name: &str) -> Result<()>;
@@ -45,6 +50,12 @@ impl SecretStore for MemoryStore {
             .map(|v| Secret::new(v.clone())))
     }
 
+    fn contains(&self, ns: &str, name: &str) -> Result<bool> {
+        Ok(self
+            .items()
+            .contains_key(&(ns.to_string(), name.to_string())))
+    }
+
     fn set(&self, ns: &str, name: &str, value: &Secret) -> Result<()> {
         self.items().insert(
             (ns.to_string(), name.to_string()),
@@ -69,6 +80,7 @@ pub struct MacKeychain;
 #[cfg(target_os = "macos")]
 mod keychain {
     use anyhow::{Context, Result};
+    use security_framework::item::{ItemClass, ItemSearchOptions};
     use security_framework::passwords::{
         delete_generic_password, get_generic_password, set_generic_password,
     };
@@ -94,6 +106,25 @@ mod keychain {
                 Err(e) if e.code() == ITEM_NOT_FOUND => Ok(None),
                 Err(e) => {
                     Err(e).with_context(|| format!("reading secret {ns}/{name} from Keychain"))
+                }
+            }
+        }
+
+        /// An attributes-only search: no data is returned, so the item's
+        /// value is never read (and macOS has no value to ask about).
+        fn contains(&self, ns: &str, name: &str) -> Result<bool> {
+            let found = ItemSearchOptions::new()
+                .class(ItemClass::generic_password())
+                .service(&service(ns))
+                .account(name)
+                .load_attributes(true)
+                .limit(1)
+                .search();
+            match found {
+                Ok(items) => Ok(!items.is_empty()),
+                Err(e) if e.code() == ITEM_NOT_FOUND => Ok(false),
+                Err(e) => {
+                    Err(e).with_context(|| format!("looking up secret {ns}/{name} in Keychain"))
                 }
             }
         }
@@ -184,8 +215,23 @@ mod tests {
             store.get(&ns, "TOKEN").unwrap().unwrap().expose(),
             "rotated"
         );
+        assert!(store.contains(&ns, "TOKEN").unwrap());
+        assert!(!store.contains(&ns, "OTHER").unwrap());
         store.delete(&ns, "TOKEN").unwrap();
         assert!(store.get(&ns, "TOKEN").unwrap().is_none());
+        assert!(!store.contains(&ns, "TOKEN").unwrap());
         store.delete(&ns, "TOKEN").unwrap();
+    }
+
+    #[test]
+    fn memory_store_contains() {
+        let store = MemoryStore::default();
+        assert!(!store.contains("ns", "TOKEN").unwrap());
+        store.set("ns", "TOKEN", &secret("abc")).unwrap();
+        assert!(store.contains("ns", "TOKEN").unwrap());
+        assert!(!store.contains("ns", "OTHER").unwrap());
+        assert!(!store.contains("other", "TOKEN").unwrap());
+        store.delete("ns", "TOKEN").unwrap();
+        assert!(!store.contains("ns", "TOKEN").unwrap());
     }
 }
