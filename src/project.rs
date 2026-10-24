@@ -12,6 +12,7 @@ use std::fmt::Write as _;
 use std::fs;
 use std::io::Read;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 /// Files read from a repository (`.git`, `commondir`, `config`) must be
@@ -79,13 +80,29 @@ pub fn identity_from_url(url: &str) -> Option<String> {
 /// inside the canonical `home` (`~` for home itself), or the absolute canonical
 /// path outside it, with unusual bytes percent-encoded. A remote identity can
 /// never contain `~` or start with `/`, so the two kinds cannot collide.
+///
+/// A `.git` not owned by the current user is ignored (see
+/// [`identity_for_root_as`]).
 pub fn identity_for_root(root: &Path, home: &Path) -> String {
+    identity_for_root_as(root, home, current_euid())
+}
+
+/// The effective uid of this process.
+pub fn current_euid() -> u32 {
+    // SAFETY: `geteuid` has no preconditions and cannot fail.
+    unsafe { libc::geteuid() }
+}
+
+/// [`identity_for_root`] for the user `euid`: the nearest `.git` counts only
+/// if `euid` owns it, so another local account cannot plant one above a
+/// shared folder to lend it a project's identity (and its secrets).
+pub fn identity_for_root_as(root: &Path, home: &Path, euid: u32) -> String {
     let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     let home = home.canonicalize().unwrap_or_else(|_| home.to_path_buf());
     // Inside home, a `.git` at home or above (a dotfiles repo) must not lend
     // its identity to unrelated projects, so only look strictly below home.
     let floor = root.starts_with(&home).then_some(home.as_path());
-    if let Some(id) = remote_identity(&root, floor) {
+    if let Some(id) = remote_identity(&root, floor, euid) {
         return id;
     }
     match root.strip_prefix(&home) {
@@ -109,8 +126,8 @@ pub fn encode_path(path: &Path) -> String {
     out
 }
 
-fn remote_identity(root: &Path, floor: Option<&Path>) -> Option<String> {
-    let remotes = remote_urls(&find_git_dirs(root, floor)?);
+fn remote_identity(root: &Path, floor: Option<&Path>, euid: u32) -> Option<String> {
+    let remotes = remote_urls(&find_git_dirs(root, floor, euid)?);
     ["upstream", "origin"].iter().find_map(|name| {
         remotes
             .get(*name)
@@ -140,12 +157,16 @@ fn read_small(path: &Path) -> Option<String> {
 /// whose `config` files apply, the git directory first and then the common
 /// directory. The nearest `.git` wins even if it is unusable (then there is no
 /// remote), matching the spec. `None` when there is no repository.
-fn find_git_dirs(start: &Path, floor: Option<&Path>) -> Option<Vec<PathBuf>> {
+fn find_git_dirs(start: &Path, floor: Option<&Path>, euid: u32) -> Option<Vec<PathBuf>> {
     let dir = start
         .ancestors()
         .take_while(|d| Some(*d) != floor)
         .find(|d| d.join(".git").exists())?;
     let dot_git = dir.join(".git");
+    // Someone else's repository is not ours: no identity from it.
+    if fs::symlink_metadata(&dot_git).ok()?.uid() != euid {
+        return None;
+    }
     let git_dir = if dot_git.is_dir() {
         dot_git
     } else {
@@ -693,5 +714,42 @@ mod tests {
         fs::create_dir_all(&outside).unwrap();
         write_git_config(&base.join("work"), &origin("git@github.com:acme/api.git"));
         assert_eq!(identity_for_root(&outside, &home), "acme/api");
+    }
+
+    #[test]
+    fn a_git_owned_by_someone_else_lends_no_identity() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path().canonicalize().unwrap();
+        let home = base.join("home");
+        let repo = home.join("repo");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        fs::write(
+            repo.join(".git/config"),
+            "[remote \"origin\"]\n\turl = git@github.com:acme/api.git\n",
+        )
+        .unwrap();
+        assert_eq!(identity_for_root(&repo, &home), "acme/api");
+        assert_eq!(
+            identity_for_root_as(&repo, &home, current_euid()),
+            "acme/api"
+        );
+        assert_eq!(
+            identity_for_root_as(&repo, &home, current_euid() + 1),
+            "~/repo"
+        );
+        // Above home too: a planted `.git` over a folder outside home.
+        let outside = base.join("shared/proj");
+        fs::create_dir_all(base.join("shared/.git")).unwrap();
+        fs::write(
+            base.join("shared/.git/config"),
+            "[remote \"origin\"]\n\turl = git@github.com:victim/app.git\n",
+        )
+        .unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        assert_eq!(identity_for_root(&outside, &home), "victim/app");
+        assert_eq!(
+            identity_for_root_as(&outside, &home, current_euid() + 1),
+            encode_path(&outside)
+        );
     }
 }

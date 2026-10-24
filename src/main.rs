@@ -75,6 +75,9 @@ impl Here {
             "cannot read the current directory (was it deleted?); cd to an existing folder and try again",
         )?;
         let levels = Levels::discover(&cwd, &home, Config::from_env()?)?;
+        for note in levels.notes() {
+            eprintln!("{note}");
+        }
         Ok(Here { cwd, home, levels })
     }
 

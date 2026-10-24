@@ -4,17 +4,20 @@
 use std::collections::HashSet;
 use std::fs;
 use std::io::ErrorKind;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
 use crate::config::Config;
-use crate::project::{encode_path, identity_for_root};
+use crate::project::{current_euid, encode_path, identity_for_root_as};
 
 /// Every `.envy/` level above a directory (nearest first), then the user level.
 pub struct Levels {
     projects: Vec<Config>,
     user: Config,
+    /// One line per `.envy` that was ignored, for stderr.
+    notes: Vec<String>,
 }
 
 /// The level a namespace name resolved to.
@@ -59,35 +62,75 @@ pub fn shadow_note(ns: &str) -> String {
 impl Levels {
     /// Walks up from `cwd` (nearest first, `cwd` included) collecting real
     /// `.envy` directories. Inside `home` the walk stops before `home`, which
-    /// is never a project; elsewhere it runs to the filesystem root. A `.envy`
-    /// symlink is ignored so a cloned repo cannot point at another directory.
+    /// is never a project; elsewhere it runs to the filesystem root.
+    ///
+    /// Ignored, each with a note ([`Levels::notes`]): a `.envy` that is a
+    /// symlink (a cloned repo cannot point envy at another directory) and one
+    /// not owned by the current effective uid (another local account cannot
+    /// plant one in a shared folder). The user's own config directory is the
+    /// user level, never a project level, and is skipped silently.
     pub fn discover(cwd: &Path, home: &Path, user: Config) -> Result<Levels> {
+        Self::discover_as(cwd, home, user, current_euid())
+    }
+
+    /// [`Levels::discover`] for the user `euid`.
+    pub fn discover_as(cwd: &Path, home: &Path, user: Config, euid: u32) -> Result<Levels> {
         let (cwd, home) = resolve_paths(cwd, home)?;
+        let user_dir = user.dir().canonicalize().ok();
         let inside_home = cwd.starts_with(&home);
         let mut projects = Vec::new();
+        let mut notes = Vec::new();
         for dir in cwd.ancestors() {
             if inside_home && dir == home {
                 break;
             }
             let envy = dir.join(".envy");
-            let is_dir = match fs::symlink_metadata(&envy) {
-                Ok(m) => m.file_type().is_dir(),
-                Err(e) if e.kind() == ErrorKind::NotFound => false,
+            let meta = match fs::symlink_metadata(&envy) {
+                Ok(m) => m,
+                Err(e) if e.kind() == ErrorKind::NotFound => continue,
                 // Fail closed: an unreadable ancestor may hide a project level.
                 Err(e) => {
                     return Err(e).with_context(|| format!("cannot access {}", encode_path(&envy)));
                 }
             };
-            if is_dir {
-                projects.push(Config::project(
-                    envy,
-                    dir.to_path_buf(),
-                    identity_for_root(dir, &home),
-                    user.dir().to_path_buf(),
+            if meta.file_type().is_symlink() {
+                notes.push(format!(
+                    "note: ignoring {}: it is a symlink",
+                    encode_path(&envy)
                 ));
+                continue;
             }
+            if !meta.is_dir() {
+                continue;
+            }
+            if meta.uid() != euid {
+                notes.push(format!(
+                    "note: ignoring {}: it is not owned by you",
+                    encode_path(&envy)
+                ));
+                continue;
+            }
+            if user_dir.as_deref() == Some(envy.as_path()) {
+                continue;
+            }
+            projects.push(Config::project(
+                envy,
+                dir.to_path_buf(),
+                identity_for_root_as(dir, &home, euid),
+                user.dir().to_path_buf(),
+            ));
         }
-        Ok(Levels { projects, user })
+        Ok(Levels {
+            projects,
+            user,
+            notes,
+        })
+    }
+
+    /// One line per ignored `.envy` (`note: ignoring <path>: <why>`), for
+    /// the caller to print on stderr.
+    pub fn notes(&self) -> &[String] {
+        &self.notes
     }
 
     /// No project level: what [`Levels::discover`] finds outside any project.
@@ -96,6 +139,7 @@ impl Levels {
         Levels {
             projects: Vec::new(),
             user,
+            notes: Vec::new(),
         }
     }
 
@@ -145,8 +189,21 @@ impl Levels {
     /// `cwd` is inside one (a `.git` directory or file), else at `cwd`.
     /// Nothing is created on disk.
     pub fn new_project_level(cwd: &Path, home: &Path, user: &Config) -> Result<Config> {
+        Self::new_project_level_as(cwd, home, user, current_euid())
+    }
+
+    /// [`Levels::new_project_level`] for the user `euid`: a `.git` someone
+    /// else owns is not a repository root, and an existing `.envy` at the
+    /// root that is a symlink or someone else's is refused.
+    pub fn new_project_level_as(
+        cwd: &Path,
+        home: &Path,
+        user: &Config,
+        euid: u32,
+    ) -> Result<Config> {
         let (cwd, home) = resolve_paths(cwd, home)?;
-        let has_git = |dir: &&Path| fs::symlink_metadata(dir.join(".git")).is_ok();
+        let has_git =
+            |dir: &&Path| fs::symlink_metadata(dir.join(".git")).is_ok_and(|m| m.uid() == euid);
         let root = if cwd.starts_with(&home) {
             // Home itself (and anything above) is never a project root, so a
             // dotfiles repo at `~/.git` is ignored.
@@ -160,13 +217,23 @@ impl Levels {
         // directory, so a project there would cover it.
         if home.starts_with(&root) {
             bail!(
-                "cannot create a project level in your home directory or a folder above it; cd into a project folder first"
+                "cannot create a project level here: the project folder would be your home directory or a folder above it; cd into a project folder first"
             );
         }
+        let envy = root.join(".envy");
+        match fs::symlink_metadata(&envy) {
+            Ok(m) if m.file_type().is_symlink() => {
+                bail!("cannot use {}: it is a symlink", encode_path(&envy))
+            }
+            Ok(m) if m.uid() != euid => {
+                bail!("cannot use {}: it is not owned by you", encode_path(&envy))
+            }
+            _ => {}
+        }
         Ok(Config::project(
-            root.join(".envy"),
+            envy,
             root.clone(),
-            identity_for_root(&root, &home),
+            identity_for_root_as(&root, &home, euid),
             user.dir().to_path_buf(),
         ))
     }
@@ -336,6 +403,13 @@ mod tests {
         let l = f.levels(&cwd);
         assert!(dirs(&l).is_empty());
         assert!(!l.resolve("dev", false).unwrap().cfg.is_project());
+        assert_eq!(
+            l.notes(),
+            [format!(
+                "note: ignoring {}: it is a symlink",
+                encode_path(&cwd.join(".envy"))
+            )]
+        );
     }
 
     #[test]
@@ -660,5 +734,80 @@ mod tests {
         fs::create_dir_all(base.join("repo/.git")).unwrap();
         let c = Levels::new_project_level(&sub, &f.home, &user).unwrap();
         assert_eq!(c.dir(), base.join("repo/.envy"));
+    }
+
+    fn other_uid() -> u32 {
+        crate::project::current_euid() + 1
+    }
+
+    #[test]
+    fn an_envy_owned_by_someone_else_is_ignored_with_a_note() {
+        let f = fixture();
+        let cwd = f.mkdir("p/sub");
+        let envy = f.home.join("p/.envy");
+        put(&envy, "dev", "A = \"1\"\n");
+        put(&f.user_dir, "dev", "A = \"2\"\n");
+        // Everything here belongs to the test user: as another uid, the
+        // `.envy` is someone else's.
+        let l = Levels::discover_as(&cwd, &f.home, f.user(), other_uid()).unwrap();
+        assert!(dirs(&l).is_empty());
+        assert_eq!(
+            l.notes(),
+            [format!(
+                "note: ignoring {}: it is not owned by you",
+                encode_path(&envy)
+            )]
+        );
+        let r = l.resolve("dev", false).unwrap();
+        assert!(!r.cfg.is_project() && !r.shadows_user);
+        assert!(!l.creation_level(false).is_project());
+        // As its owner: a level, and no note.
+        let l = f.levels(&cwd);
+        assert_eq!(dirs(&l), vec![envy]);
+        assert!(l.notes().is_empty());
+    }
+
+    #[test]
+    fn the_user_level_directory_is_never_a_project_level() {
+        let f = fixture();
+        let dots = f.mkdir("dots");
+        let user = Config::new(dots.join(".envy"));
+        put(&dots.join(".envy"), "dev", "A = \"1\"\n");
+        for cwd in [dots.clone(), f.mkdir("dots/sub")] {
+            let l = Levels::discover(&cwd, &f.home, user.clone()).unwrap();
+            assert!(dirs(&l).is_empty());
+            assert!(l.notes().is_empty());
+            let r = l.resolve("dev", false).unwrap();
+            assert!(!r.cfg.is_project() && !r.shadows_user);
+        }
+        // Also when the user dir is named through a symlink.
+        symlink(dots.join(".envy"), f.home.join("conf-link")).unwrap();
+        let user = Config::new(f.home.join("conf-link"));
+        let l = Levels::discover(&dots, &f.home, user).unwrap();
+        assert!(dirs(&l).is_empty());
+    }
+
+    #[test]
+    fn new_project_level_ignores_someone_elses_git_and_envy() {
+        let f = fixture();
+        let user = f.user();
+        let repo = f.mkdir("repo");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        let sub = f.mkdir("repo/sub");
+        // Someone else's `.git`: not a repository root for us.
+        let c = Levels::new_project_level_as(&sub, &f.home, &user, other_uid()).unwrap();
+        assert_eq!(c.dir(), sub.join(".envy"));
+        assert_eq!(c.identity(), Some("~/repo/sub"));
+        // Ours: the root.
+        let c = Levels::new_project_level(&sub, &f.home, &user).unwrap();
+        assert_eq!(c.dir(), repo.join(".envy"));
+        // An existing `.envy` there that is a symlink or someone else's.
+        symlink(f.mkdir("elsewhere"), repo.join(".envy")).unwrap();
+        let err = Levels::new_project_level(&sub, &f.home, &user).unwrap_err();
+        assert!(err.to_string().contains("symlink"), "{err}");
+        fs::remove_file(repo.join(".envy")).unwrap();
+        fs::create_dir(repo.join(".envy")).unwrap();
+        let err = Levels::new_project_level_as(&repo, &f.home, &user, other_uid()).unwrap_err();
+        assert!(err.to_string().contains("not owned by you"), "{err}");
     }
 }

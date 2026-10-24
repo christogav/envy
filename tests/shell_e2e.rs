@@ -1512,3 +1512,41 @@ fn e2e_a_fifo_named_like_a_namespace_fails_promptly() {
     let out = p.zsh(&p.repo, "envy fifo || print -r -- failed\n");
     assert_eq!(stdout(&out), "failed\n");
 }
+
+#[test]
+fn e2e_a_symlinked_envy_is_ignored_with_a_note() {
+    let p = project();
+    let elsewhere = p.home.join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    std::fs::write(elsewhere.join("dev.toml"), PROJECT_DEV).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, p.repo.join(".envy")).unwrap();
+    p.put_user("dev", USER_DEV);
+    let note = format!(
+        "note: ignoring {}: it is a symlink\n",
+        encode_path(&p.repo.join(".envy"))
+    );
+    let out = p.envy(&p.repo, &["--list"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "  dev\n");
+    assert_eq!(stderr(&out), note);
+    let out = p.zsh(&p.repo, "envy dev\nprint -r -- \"$WHERE\"\n");
+    assert_eq!(stdout(&out), "user\n");
+    assert_eq!(stderr(&out), note);
+}
+
+#[test]
+fn e2e_a_user_config_dir_named_envy_is_still_the_user_level() {
+    let p = project();
+    let dots = p.home.join("dots");
+    let conf = dots.join(".envy");
+    std::fs::create_dir_all(&conf).unwrap();
+    std::fs::write(conf.join("dev.toml"), USER_DEV).unwrap();
+    let script = format!(
+        "export ENVY_CONFIG_DIR={}\nenvy dev\nprint -r -- \"$WHERE|$ENVY_SOURCE\"\nenvy\n",
+        sh_quote(&conf.display().to_string())
+    );
+    let out = p.zsh(&dots, &script);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "user|user\n* dev\n");
+    assert_eq!(stderr(&out), "");
+}
