@@ -1,0 +1,36 @@
+name: Auto release
+
+# Bumping `version` in Cargo.toml and merging it is the release. This starts
+# the Release workflow for that version unless it has already been released.
+#
+# The tag is created by the Release workflow itself (dist-workspace.toml sets
+# dispatch-releases), so no personal access token is needed here: a tag pushed
+# with GITHUB_TOKEN would not start any workflow, but a dispatch can.
+
+on:
+  push:
+    branches: [main]
+    paths: [Cargo.toml]
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Start the release if this version is new
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          [ -n "$version" ] || { echo "no version in Cargo.toml" >&2; exit 1; }
+          tag="v$version"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "$tag is already released; nothing to do."
+            exit 0
+          fi
+          echo "Starting the release of $tag."
+          gh workflow run release.yml --ref main -f "tag=$tag"
