@@ -1485,3 +1485,30 @@ print -r -- "${FIRST-unset}|${ENVY_EVAL-unset}|${ENVY_ACTIVE-unset}|$ENVY_CONFIG
     );
     assert!(!err.contains("zq-elsewhere"), "{err}");
 }
+
+#[test]
+fn e2e_a_fifo_named_like_a_namespace_fails_promptly() {
+    let p = project();
+    std::fs::create_dir_all(p.repo.join(".envy")).unwrap();
+    let fifo = p.repo.join(".envy/fifo.toml");
+    let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+    // SAFETY: a valid NUL-terminated path.
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
+    // `detached` kills it (and fails) after 10 seconds.
+    for args in [&["fifo", "--list"][..], &["--list"]] {
+        let out = p.envy(&p.repo, args);
+        if args.len() == 2 {
+            assert_eq!(out.status.code(), Some(1));
+            assert_eq!(stdout(&out), "");
+            assert!(
+                stderr(&out).contains("not a regular file"),
+                "{}",
+                stderr(&out)
+            );
+        } else {
+            assert!(out.status.success(), "{}", stderr(&out));
+        }
+    }
+    let out = p.zsh(&p.repo, "envy fifo || print -r -- failed\n");
+    assert_eq!(stdout(&out), "failed\n");
+}

@@ -1,6 +1,6 @@
 use std::ffi::OsString;
 use std::fs;
-use std::io::{ErrorKind, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -528,26 +528,18 @@ impl Config {
     pub fn load(&self, name: &str) -> Result<NamespaceFile> {
         let path = self.path_for(name)?;
         let project = self.is_project();
-        if project && fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink()) {
-            bail!(
-                "refusing project namespace {name:?} ({}): it is a symlink",
-                encode_path(&path)
-            );
-        }
-        let text = match fs::read_to_string(&path) {
-            Ok(text) => text,
-            Err(e) if e.kind() == ErrorKind::NotFound => {
-                bail!("namespace {name:?} does not exist (use --new to create it)")
+        let text = if project {
+            read_project_file(name, &path)?
+        } else {
+            match fs::read_to_string(&path) {
+                Ok(text) => text,
+                Err(e) if e.kind() == ErrorKind::NotFound => {
+                    bail!("namespace {name:?} does not exist (use --new to create it)")
+                }
+                Err(e) => {
+                    return Err(e).with_context(|| format!("cannot read namespace {name:?}"));
+                }
             }
-            Err(e) if project => {
-                return Err(e).with_context(|| {
-                    format!(
-                        "cannot read project namespace {name:?} ({})",
-                        encode_path(&path)
-                    )
-                });
-            }
-            Err(e) => return Err(e).with_context(|| format!("cannot read namespace {name:?}")),
         };
         let mut file = if project {
             NamespaceFile::parse(name, &text)
@@ -610,6 +602,49 @@ impl Config {
             Err(e) => Err(e).with_context(|| format!("cannot delete namespace {name:?}")),
         }
     }
+}
+
+/// The largest project namespace file envy reads.
+pub(crate) const MAX_PROJECT_FILE: usize = 1024 * 1024;
+
+/// Reads a project namespace file, which the repository controls: never
+/// through a symlink (`O_NOFOLLOW`, so a swap after the check is refused too),
+/// only a regular file (checked on the open handle; `O_NONBLOCK` keeps a FIFO
+/// from blocking the open), and at most [`MAX_PROJECT_FILE`] bytes. Errors
+/// name the file with its path percent-encoded.
+fn read_project_file(name: &str, path: &Path) -> Result<String> {
+    let shown = encode_path(path);
+    let symlink =
+        || anyhow::anyhow!("refusing project namespace {name:?} ({shown}): it is a symlink");
+    if fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err(symlink());
+    }
+    let cannot_read = || format!("cannot read project namespace {name:?} ({shown})");
+    let file = match fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            bail!("namespace {name:?} does not exist (use --new to create it)")
+        }
+        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => return Err(symlink()),
+        Err(e) => return Err(e).with_context(cannot_read),
+    };
+    if !file.metadata().with_context(cannot_read)?.is_file() {
+        bail!("refusing project namespace {name:?} ({shown}): it is not a regular file");
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_PROJECT_FILE as u64 + 1)
+        .read_to_end(&mut bytes)
+        .with_context(cannot_read)?;
+    if bytes.len() > MAX_PROJECT_FILE {
+        bail!("refusing project namespace {name:?} ({shown}): it is larger than 1 MiB");
+    }
+    String::from_utf8(bytes).map_err(|_| {
+        anyhow::anyhow!("cannot read project namespace {name:?} ({shown}): it is not UTF-8")
+    })
 }
 
 fn dir_from_env(config_dir: Option<OsString>, home: Option<OsString>) -> Result<PathBuf> {
@@ -1213,6 +1248,81 @@ mod tests {
         assert_eq!(
             cfg.load("ok").unwrap().vars(),
             vec![("envy_x".to_string(), Value::Plain("1".into()))]
+        );
+    }
+
+    fn project_level() -> (tempfile::TempDir, Config) {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap().join("repo");
+        let cfg = Config::project(
+            root.join(".envy"),
+            root.clone(),
+            "acme/api".into(),
+            tmp.path().join("user"),
+        );
+        fs::create_dir_all(cfg.dir()).unwrap();
+        (tmp, cfg)
+    }
+
+    /// `cfg.load(ns)` on another thread; fails the test if it blocks.
+    fn load_promptly(cfg: &Config, ns: &str) -> Result<NamespaceFile> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (cfg, ns) = (cfg.clone(), ns.to_string());
+        std::thread::spawn(move || {
+            let _ = tx.send(cfg.load(&ns));
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("loading the namespace blocked")
+    }
+
+    #[test]
+    fn project_load_refuses_a_fifo_without_blocking() {
+        let (_tmp, cfg) = project_level();
+        let fifo = cfg.dir().join("fifo.toml");
+        let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
+        let err = format!("{:#}", load_promptly(&cfg, "fifo").unwrap_err());
+        assert!(
+            err.contains("not a regular file") && err.contains(&encode_path(&fifo)),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn project_load_has_a_size_limit() {
+        let (_tmp, cfg) = project_level();
+        let path = cfg.dir().join("big.toml");
+        // A comment line padded to exactly the limit parses.
+        let mut text = "# ".to_string();
+        text.push_str(&"x".repeat(MAX_PROJECT_FILE - 3));
+        text.push('\n');
+        assert_eq!(text.len(), MAX_PROJECT_FILE);
+        fs::write(&path, &text).unwrap();
+        assert!(load_promptly(&cfg, "big").unwrap().vars().is_empty());
+        // One byte more is refused, naming the file and the limit.
+        text.insert(0, ' ');
+        fs::write(&path, &text).unwrap();
+        let err = format!("{:#}", load_promptly(&cfg, "big").unwrap_err());
+        assert!(
+            err.contains("larger than 1 MiB") && err.contains(&encode_path(&path)),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn project_load_still_names_a_symlink() {
+        let (_tmp, cfg) = project_level();
+        let real = cfg.dir().join("real.txt");
+        fs::write(&real, "[vars]\nA = \"1\"\n").unwrap();
+        std::os::unix::fs::symlink(&real, cfg.dir().join("dev.toml")).unwrap();
+        let err = format!("{:#}", cfg.load("dev").unwrap_err());
+        assert!(err.contains("symlink") && err.contains("dev.toml"), "{err}");
+        assert!(
+            cfg.load("nope")
+                .unwrap_err()
+                .to_string()
+                .contains("does not exist")
         );
     }
 }
