@@ -1185,8 +1185,8 @@ mod tests {
         assert_eq!(read(&dir, "c"), theirs_c);
     }
 
-    /// Group where the source `a` has just lost OLD and OLDS (as Task 9's
-    /// `--edit` would leave it); `b` and `c` still have them.
+    /// Group where the source `a` has just lost OLD and OLDS (as an `--edit`
+    /// that removed them would leave it); `b` and `c` still have them.
     fn removal_fixture() -> (tempfile::TempDir, Config, MemoryStore) {
         let b = "link = \"aws\"\n\n[vars]\nREGION = \"us\"\nOLD = \"x\"\nOLDS = \"@keychain\"\n";
         let c = "link = \"aws\"\n\n[vars]\nOLDS = \"@keychain\"\nREGION = \"ap\"\n";

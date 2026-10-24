@@ -141,6 +141,11 @@ fn run(command: Command) -> Result<String> {
             let source = match &like {
                 Some(name) => {
                     let cfg = here.resolve(name, scope)?;
+                    if scope == Scope::User && !cfg.exists(name)? {
+                        bail!(
+                            "namespace {name:?} does not exist in your own level (--user also applies to the --like source; to copy a project namespace, leave out --user)"
+                        );
+                    }
                     Some((cfg, cfg.load(name)?))
                 }
                 None => None,

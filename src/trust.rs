@@ -64,6 +64,11 @@ impl TrustStore {
     /// handle, with `O_NOFOLLOW | O_NONBLOCK` so neither a symlink nor a FIFO
     /// can redirect or block the read), oversized, unreadable or malformed.
     fn read_record(&self, root: &Path, ns: &str) -> Option<String> {
+        // A `trust/` that is a symlink (or not a directory) holds no records:
+        // it could point at records someone else wrote.
+        if !fs::symlink_metadata(&self.dir).ok()?.file_type().is_dir() {
+            return None;
+        }
         let file = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
@@ -108,18 +113,18 @@ impl TrustStore {
             .recursive(true)
             .mode(0o700)
             .create(&self.dir)
-            .with_context(|| format!("cannot create {}", self.dir.display()))?;
+            .with_context(|| format!("cannot create {}", encode_path(&self.dir)))?;
         let meta = fs::symlink_metadata(&self.dir)
-            .with_context(|| format!("cannot inspect {}", self.dir.display()))?;
+            .with_context(|| format!("cannot inspect {}", encode_path(&self.dir)))?;
         if !meta.file_type().is_dir() {
             bail!(
                 "{} is not a directory (is it a symlink or a file?)",
-                self.dir.display()
+                encode_path(&self.dir)
             );
         }
         if meta.permissions().mode() & 0o022 != 0 {
             fs::set_permissions(&self.dir, fs::Permissions::from_mode(0o700))
-                .with_context(|| format!("cannot tighten {}", self.dir.display()))?;
+                .with_context(|| format!("cannot tighten {}", encode_path(&self.dir)))?;
         }
         Ok(())
     }
@@ -690,6 +695,42 @@ mod tests {
         assert_eq!(
             confirmation_text_for(&cfg, &file, &have, Purpose::Load, false),
             confirmation_text(&cfg, &file, &have)
+        );
+    }
+
+    #[test]
+    fn a_symlinked_trust_directory_trusts_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let other = tmp.path().join("other");
+        let user = tmp.path().join("user");
+        fs::create_dir_all(&user).unwrap();
+        let root = Path::new("/work/repo");
+        TrustStore::new(&other).record(root, "dev", "text").unwrap();
+        assert!(
+            TrustStore::new(&other)
+                .is_trusted(root, "dev", "text")
+                .unwrap()
+        );
+        std::os::unix::fs::symlink(other.join("trust"), user.join("trust")).unwrap();
+        let store = TrustStore::new(&user);
+        assert!(!store.is_trusted(root, "dev", "text").unwrap());
+        assert!(!store.previously_trusted(root, "dev").unwrap());
+        // A file in its place: the same, and recording names it, encoded.
+        fs::remove_file(user.join("trust")).unwrap();
+        fs::write(user.join("trust"), "x").unwrap();
+        assert!(!store.is_trusted(root, "dev", "text").unwrap());
+        let err = store.record(root, "dev", "text").unwrap_err();
+        assert!(format!("{err:#}").contains("/user/trust"), "{err:#}");
+        let evil = tmp.path().join("ev\u{1b}[31mil");
+        fs::create_dir_all(&evil).unwrap();
+        fs::write(evil.join("trust"), "x").unwrap();
+        let err = format!(
+            "{:#}",
+            TrustStore::new(&evil).record(root, "dev", "t").unwrap_err()
+        );
+        assert!(
+            !err.chars().any(char::is_control) && err.contains("%1B"),
+            "{err:?}"
         );
     }
 }

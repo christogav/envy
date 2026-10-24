@@ -4841,6 +4841,96 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_edit_records_no_trust() {
+        let base = tempfile::tempdir().unwrap();
+        let cfg = checkout(base.path(), "a", T0);
+        let store = FailingSet {
+            inner: MemoryStore::default(),
+            fail_on: "NEW",
+        };
+        let prompt = ScriptedPrompter::new()
+            .with_confirm(true)
+            .with_secret("n-1");
+        let ctx = Ctx {
+            cfg: &cfg,
+            store: &store,
+            prompt: &prompt,
+        };
+        let add = |path: &Path| {
+            let text = std::fs::read_to_string(path)?;
+            std::fs::write(path, format!("{text}NEW = \"@keychain\"\n"))?;
+            Ok(())
+        };
+        assert!(edit(&ctx, "dev", &add).is_err());
+        assert_eq!(prompt.remaining(), 0);
+        assert_eq!(
+            std::fs::read_to_string(cfg.dir().join("dev.toml")).unwrap(),
+            T0
+        );
+        assert!(store.inner.snapshot().is_empty());
+        assert!(!base.path().join("user/trust").exists());
+    }
+
+    #[test]
+    fn a_failed_link_records_no_trust() {
+        let base = tempfile::tempdir().unwrap();
+        let cfg = checkout(base.path(), "a", T0);
+        std::fs::write(
+            cfg.dir().join("other.toml"),
+            "link = \"g\"\n[vars]\nREGION = \"x\"\nTOKEN = \"@keychain\"\nNEW = \"@keychain\"\n",
+        )
+        .unwrap();
+        let store = FailingSet {
+            inner: MemoryStore::default(),
+            fail_on: "NEW",
+        };
+        let prompt = ScriptedPrompter::new()
+            .with_confirm(true)
+            .with_secret("n-1");
+        let ctx = Ctx {
+            cfg: &cfg,
+            store: &store,
+            prompt: &prompt,
+        };
+        let err = format!("{:#}", link::link(&ctx, "dev", "g").unwrap_err());
+        // It got as far as the Keychain write: every question was answered.
+        assert_eq!(prompt.remaining(), 0, "{err}");
+        assert!(err.contains("simulated Keychain failure"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(cfg.dir().join("dev.toml")).unwrap(),
+            T0
+        );
+        assert!(store.inner.snapshot().is_empty());
+        assert!(!base.path().join("user/trust").exists());
+    }
+
+    fn is_root() -> bool {
+        crate::project::current_euid() == 0
+    }
+
+    #[test]
+    fn a_failed_unlink_records_no_trust() {
+        if is_root() {
+            return;
+        }
+        let base = tempfile::tempdir().unwrap();
+        let cfg = checkout(base.path(), "a", LINKED_T0);
+        // The save cannot create its temp file in a read-only directory.
+        std::fs::set_permissions(cfg.dir(), std::fs::Permissions::from_mode(0o500)).unwrap();
+        let store = MemoryStore::default();
+        let prompt = ScriptedPrompter::new().with_confirm(true);
+        let result = link::unlink(&ctx_of(&cfg, &store, &prompt), "dev");
+        std::fs::set_permissions(cfg.dir(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(result.is_err());
+        assert_eq!(prompt.remaining(), 0);
+        assert_eq!(
+            std::fs::read_to_string(cfg.dir().join("dev.toml")).unwrap(),
+            LINKED_T0
+        );
+        assert!(!base.path().join("user/trust").exists());
+    }
+
+    #[test]
     fn user_level_mutations_never_confirm() {
         let (dir, cfg) = config_with(&[("work", "[vars]\nA = \"x\"\n")]);
         let store = MemoryStore::default();

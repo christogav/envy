@@ -1263,6 +1263,24 @@ fn e2e_new_like_an_unknown_namespace_creates_nothing() {
         assert!(!p.repo.join(".envy/fresh.toml").exists(), "{args:?}");
         assert!(!p.user.join("fresh.toml").exists(), "{args:?}");
     }
+    // `--user` applies to the source too: a project-only name is not found,
+    // and the error says why.
+    let out = p.envy(&p.repo, &["fresh", "--new", "--like", "dev", "--user"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(stdout(&out), "");
+    let err = stderr(&out);
+    assert!(
+        err.contains("\"dev\"") && err.contains("--user also applies to the --like source"),
+        "{err}"
+    );
+    assert!(!p.user.join("fresh.toml").exists());
+    // Without `--user`, no such hint.
+    let out = p.envy(&p.home, &["fresh", "--new", "--like", "dev"]);
+    assert!(
+        !stderr(&out).contains("--user also applies"),
+        "{}",
+        stderr(&out)
+    );
     // `--like` resolves the source with the same rule: the project's `dev`.
     p.trust("dev");
     let out = p.envy(&p.repo, &["copy", "--new", "--like", "dev"]);
@@ -1399,11 +1417,26 @@ fn e2e_user_flag_reaches_the_users_namespace_in_every_command() {
     assert_eq!(read(&p.repo.join(".envy/copy2.toml")), PROJECT_DEV);
     assert!(!p.user.join("copy2.toml").exists());
 
-    // `--rm --user` asks first, and there is no terminal to ask on.
+    // `--rm --user` asks first, and there is no terminal to ask on. The
+    // question is the user-level one: no project wording, no shadow note.
     let out = p.envy(&p.repo, &["dev", "--rm", "--user"]);
     assert_eq!(out.status.code(), Some(1));
     assert_eq!(stdout(&out), "");
-    assert!(stderr(&out).contains("terminal"), "{}", stderr(&out));
+    let err = stderr(&out);
+    assert!(
+        err.starts_with("error: ") && err.contains("terminal"),
+        "{err}"
+    );
+    assert!(!err.contains("project") && !err.contains("note:"), "{err}");
+    // Without `--user`, the project's: the note and the project question.
+    let out = p.envy(&p.repo, &["dev", "--rm"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(stdout(&out), "");
+    let err = stderr(&out);
+    assert!(
+        err.starts_with(SHADOW) && err.contains("deleting project namespace \"dev\""),
+        "{err}"
+    );
     assert_eq!(read(&user_file), user_text);
     project_unchanged();
 }
