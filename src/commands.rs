@@ -110,16 +110,62 @@ pub(crate) fn check_trust_for(ctx: &Ctx, file: &NamespaceFile, purpose: Purpose)
         question.push_str("Note: this namespace file has changed since you last trusted it.\n\n");
     }
     question.push_str(&confirmation_text_for(ctx.cfg, file, &in_keychain, purpose));
+    let (hint, nothing) = match purpose {
+        Purpose::Load => (
+            format!("run envy {ns} in a terminal"),
+            "nothing was changed",
+        ),
+        Purpose::Copy => (
+            "run the command again in a terminal".to_string(),
+            "nothing was copied",
+        ),
+        Purpose::Change => (
+            "run the command again in a terminal to review the namespace first".to_string(),
+            "nothing was changed",
+        ),
+    };
     let yes = ctx.prompt.confirm(&question).with_context(|| {
         format!(
             "project namespace {ns:?} is not trusted yet and needs a terminal to review it \
-             (run envy {ns} in a terminal); nothing was changed"
+             ({hint}); {nothing}"
         )
     })?;
     if !yes {
-        bail!("not loaded: you did not trust namespace {ns:?}; nothing was changed");
+        let not = match purpose {
+            Purpose::Load => "not loaded",
+            Purpose::Copy => "not copied",
+            Purpose::Change => "not changed",
+        };
+        bail!("{not}: you did not trust namespace {ns:?}; {nothing}");
     }
     Ok(true)
+}
+
+/// Asks before a project namespace is changed, unless its current contents
+/// are already trusted ([`check_trust_for`] with [`Purpose::Change`]). Called
+/// on the same in-memory file the command then changes, before any other
+/// question, any editor and any write; the caller then records the file it
+/// wrote with [`record_trust_after_change`]. A `git pull` that slipped a line
+/// into the file is thus shown, never trusted just because the user ran an
+/// envy command on it.
+pub(crate) fn check_trust_for_change(ctx: &Ctx, file: &NamespaceFile) -> Result<()> {
+    check_trust_for(ctx, file, Purpose::Change).map(|_| ())
+}
+
+/// Records `file`, the namespace the user just changed, as trusted: always,
+/// even when it was trusted before the change, so the user's own change is
+/// not asked about at the next load. Only that namespace: other members of
+/// its link group rewritten along with it are not recorded (their plain
+/// values were never shown), and are confirmed at their first load. A no-op
+/// at user level.
+pub(crate) fn record_trust_after_change(ctx: &Ctx, file: &NamespaceFile) -> Result<()> {
+    record_trust(ctx, file).with_context(|| {
+        format!(
+            "namespace {:?} was changed, but its trust could not be recorded; \
+             it will be confirmed at its next load",
+            file.name()
+        )
+    })
 }
 
 /// Records that the user trusts `file` as it is now, at this checkout. Does
@@ -428,9 +474,15 @@ fn restore_files(
 /// at this level fails as "already exists". At project level the new file is
 /// recorded as trusted: the user just wrote it.
 ///
-/// Order: validate, check that the namespace can join the group, prompt for
-/// everything, re-check that `ns` still does not exist, then [`apply`]. A
-/// failure at any step leaves nothing behind.
+/// `like`'s `Config` must be the one its file was loaded from (the file's
+/// secret key is checked against it): it decides whether the source is a
+/// project file to confirm, and against which checkout.
+///
+/// Order: validate; check that the source pair matches; if the source is an
+/// unconfirmed project file, show its confirmation ([`Purpose::Copy`]); check
+/// that the namespace can join the group; prompt for everything; re-check
+/// that `ns` still does not exist; then [`apply`] and record the new file as
+/// trusted. A failure at any step leaves nothing behind.
 pub fn create(
     ctx: &Ctx,
     ns: &str,
@@ -450,6 +502,17 @@ pub fn create(
     };
     if taken(ctx)? {
         bail!("namespace {ns:?} already exists");
+    }
+    // A user-level `Config` paired with a project file would skip the
+    // confirmation below; a different project's would check the wrong
+    // checkout. Both fail closed.
+    if let Some((source_cfg, source)) = like {
+        anyhow::ensure!(
+            source.secret_key() == source_cfg.secret_key(source.name()),
+            "internal error: --like namespace {:?} was not loaded from the given config; \
+             nothing was created",
+            source.name()
+        );
     }
     // Copying is not loading, but it moves a project file's variables into a
     // namespace that is then trusted (or, at user level, never asked about):
@@ -562,10 +625,13 @@ impl SetItem {
 /// variable asks first. In a linked namespace the rest of the group is then
 /// made to match `ns`, for every item at once (see [`link::conform`]).
 ///
-/// Names (and inline values) are all checked first. Then everything, for every
-/// item and every member, is asked in the order given, before anything is
-/// written; then, unless `ns` or its group changed meanwhile
-/// ([`link::ensure_unchanged`]), the writes go through a single [`apply`].
+/// Names (and inline values) are all checked first. At project level the
+/// file's current contents must then be trusted, or confirmed
+/// ([`check_trust_for_change`]). Then everything, for every item and every
+/// member, is asked in the order given, before anything is written; then,
+/// unless `ns` or its group changed meanwhile ([`link::ensure_unchanged`]),
+/// the writes go through a single [`apply`], and the new `ns` (only) is
+/// recorded as trusted.
 pub fn set_vars(ctx: &Ctx, ns: &str, items: &[SetItem]) -> Result<()> {
     validate_namespace(ns)?;
     if items.is_empty() {
@@ -586,6 +652,8 @@ pub fn set_vars(ctx: &Ctx, ns: &str, items: &[SetItem]) -> Result<()> {
     let before = ctx.cfg.load(ns)?;
     // Loaded before prompting, so an unreadable member stops us early.
     let others = link::others(ctx.cfg, &before)?;
+    check_trust_for_change(ctx, &before)?;
+    let shown = display_ns(ctx.cfg, ns);
     let mut file = before.clone();
     let mut secrets: Vec<(String, Secret)> = Vec::new();
     let mut delete: Vec<String> = Vec::new();
@@ -610,7 +678,7 @@ pub fn set_vars(ctx: &Ctx, ns: &str, items: &[SetItem]) -> Result<()> {
                             _ => None,
                         };
                         ctx.prompt
-                            .plain(&plain_label(name, ns), default)
+                            .plain(&plain_label(name, &shown), default)
                             .with_context(|| format!("no value for {name}; nothing was changed"))?
                     }
                 };
@@ -630,7 +698,7 @@ pub fn set_vars(ctx: &Ctx, ns: &str, items: &[SetItem]) -> Result<()> {
                 }
                 let secret = ctx
                     .prompt
-                    .secret(&secret_label(name, ns))
+                    .secret(&secret_label(name, &shown))
                     .with_context(|| format!("no value for secret {name}; nothing was changed"))?;
                 file.set_var(name, Value::Secret)?;
                 secrets.push((name.to_string(), secret));
@@ -642,6 +710,8 @@ pub fn set_vars(ctx: &Ctx, ns: &str, items: &[SetItem]) -> Result<()> {
     // The prompts can take a while: do not overwrite a change made meanwhile
     // (to `ns` or to its group).
     link::ensure_unchanged(ctx.cfg, &before, before.link(), &others)?;
+    // `save` writes exactly `file.text()`, so that is what gets recorded.
+    let saved = file.clone();
     let mut changes = vec![Change {
         file,
         before: Some(before),
@@ -649,7 +719,8 @@ pub fn set_vars(ctx: &Ctx, ns: &str, items: &[SetItem]) -> Result<()> {
         delete,
     }];
     changes.extend(group);
-    apply(ctx, changes)
+    apply(ctx, changes)?;
+    record_trust_after_change(ctx, &saved)
 }
 
 /// Checks a plain value given on the command line before anything is asked:
@@ -751,14 +822,18 @@ pub fn remove(ctx: &Ctx, ns: &str) -> Result<()> {
 ///   edited file ([`link::conform`]), even when nothing was edited, which
 ///   repairs a group that drifted through hand edits.
 ///
+/// At project level the file's current contents must be trusted, or
+/// confirmed ([`check_trust_for_change`]), before the editor is started.
 /// Everything is prompted before anything is written; the writes then go
-/// through [`apply`]. An unedited file is not rewritten. Returns whether
+/// through [`apply`]. An unedited file is not rewritten. The resulting `ns`
+/// (only) is then recorded as trusted, edited or not. Returns whether
 /// anything was written (in `ns` or elsewhere in its group).
 pub fn edit(ctx: &Ctx, ns: &str, run_editor: &dyn Fn(&Path) -> Result<()>) -> Result<bool> {
     validate_namespace(ns)?;
     let before = load_for_edit(ctx.cfg, ns)?;
     // Checked before the editor runs, so an unreadable member stops us early.
     link::others(ctx.cfg, &before)?;
+    check_trust_for_change(ctx, &before)?;
 
     let dir = tempfile::Builder::new()
         .prefix("envy-edit-")
@@ -802,7 +877,7 @@ pub fn edit(ctx: &Ctx, ns: &str, run_editor: &dyn Fn(&Path) -> Result<()>) -> Re
         if value == Value::Secret && !was_secret(&name) {
             let secret = ctx
                 .prompt
-                .secret(&secret_label(&name, ns))
+                .secret(&secret_label(&name, &display_ns(ctx.cfg, ns)))
                 .with_context(|| format!("no value for secret {name}; nothing was changed"))?;
             secrets.push((name, secret));
         }
@@ -816,6 +891,9 @@ pub fn edit(ctx: &Ctx, ns: &str, run_editor: &dyn Fn(&Path) -> Result<()>) -> Re
         bail!("namespace {ns:?} was changed while envy was editing it; nothing was changed");
     }
     link::ensure_unchanged(ctx.cfg, &before, after.link(), &others)?;
+    // What `ns` holds once this returns: `after` if saved, else `before`
+    // (the same text). The user confirmed or edited it, so it is trusted.
+    let result = after.clone();
     let mut changes: Vec<Change> = Vec::new();
     if after.text() != before.text() {
         changes.push(Change {
@@ -826,11 +904,12 @@ pub fn edit(ctx: &Ctx, ns: &str, run_editor: &dyn Fn(&Path) -> Result<()>) -> Re
         });
     }
     changes.extend(group);
-    if changes.is_empty() {
-        return Ok(false);
+    let wrote = !changes.is_empty();
+    if wrote {
+        apply(ctx, changes)?;
     }
-    apply(ctx, changes)?;
-    Ok(true)
+    record_trust_after_change(ctx, &result)?;
+    Ok(wrote)
 }
 
 /// Loads `ns` for editing. A file that does not parse cannot be reconciled
@@ -3929,9 +4008,9 @@ mod tests {
             None,
         )
         .unwrap_err();
-        assert!(
-            format!("{err:#}").contains("nothing was changed"),
-            "{err:#}"
+        assert_eq!(
+            err.to_string(),
+            "not copied: you did not trust namespace \"dev\"; nothing was copied"
         );
         assert!(!target.present("new").unwrap());
         assert!(store.snapshot().is_empty());
@@ -4141,5 +4220,416 @@ mod tests {
         remove(&ctx_of(&cfg, &store, &p), "dev").unwrap();
         assert!(!cfg.exists("dev").unwrap());
         assert_eq!(store.snapshot(), vec![entry("dev", "TOKEN", "u")]);
+    }
+
+    // ---- changing a project namespace: trust first, then record the result ----
+
+    const CHANGE_END: &str = "\n\nAllow envy to change this namespace, and trust the result";
+    const HOSTILE: &str = "NODE_OPTIONS = \"--require /tmp/x.js\"\n";
+    const T0: &str = "[vars]\nREGION = \"eu\"\nTOKEN = \"@keychain\"\n";
+    const LINKED_T0: &str = "link = \"aws\"\n[vars]\nREGION = \"eu\"\nTOKEN = \"@keychain\"\n";
+
+    /// Everything a command could change: every file under the checkout and
+    /// the user dir (namespace files and trust records), with their contents.
+    fn disk(base: &Path) -> Vec<(String, String)> {
+        fn walk(dir: &Path, base: &Path, out: &mut Vec<(String, String)>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for e in entries {
+                let path = e.unwrap().path();
+                if path.is_dir() {
+                    walk(&path, base, out);
+                } else {
+                    out.push((
+                        path.strip_prefix(base).unwrap().display().to_string(),
+                        std::fs::read_to_string(&path).unwrap(),
+                    ));
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(base, base, &mut out);
+        out.sort();
+        out
+    }
+
+    /// Checkout `a` whose `dev` was trusted as `t0`, then changed on disk by a
+    /// pull that slipped in a hostile line. TOKEN is in the Keychain.
+    fn pulled(base: &Path, t0: &str) -> (Config, MemoryStore) {
+        let cfg = checkout(base, "a", t0);
+        crate::trust::TrustStore::new(cfg.user_dir())
+            .record(cfg.root().unwrap(), "dev", t0)
+            .unwrap();
+        std::fs::write(cfg.dir().join("dev.toml"), format!("{t0}{HOSTILE}")).unwrap();
+        let store = MemoryStore::default();
+        store.set(PKEY, "TOKEN", &Secret::new("t".into())).unwrap();
+        (cfg, store)
+    }
+
+    /// The first prompt is the Change confirmation for the pulled file.
+    fn assert_change_confirmation_first(prompt: &ScriptedPrompter, changed: bool) {
+        let asked = prompt.asked();
+        let Some(Asked::Confirm(text)) = asked.first() else {
+            panic!("first prompt is not the confirmation: {asked:?}")
+        };
+        assert_eq!(text.starts_with(CHANGED_NOTE), changed, "{text}");
+        assert!(text.ends_with(CHANGE_END), "{text}");
+        assert!(
+            text.contains("Project namespace \"dev\" from acme/api"),
+            "{text}"
+        );
+        if changed {
+            assert!(
+                text.contains("NODE_OPTIONS") && text.contains("\"--require /tmp/x.js\""),
+                "{text}"
+            );
+        }
+    }
+
+    /// Loading `dev` now needs no question at all.
+    fn activates_quietly(cfg: &Config, store: &MemoryStore) {
+        let quiet = ScriptedPrompter::new();
+        activate(&ctx_of(cfg, store, &quiet), "dev", &ActiveState::default()).unwrap();
+        assert!(quiet.asked().is_empty(), "{:?}", quiet.asked());
+    }
+
+    /// Runs `run` against a pulled (trusted, then changed) `dev` built from
+    /// `t0`: declined, then with no terminal, then accepted. `answers` adds
+    /// what the command asks after the confirmation; `check` inspects the
+    /// accepted result.
+    fn pulled_case(
+        t0: &str,
+        run: &dyn Fn(&Ctx) -> Result<()>,
+        answers: &dyn Fn(ScriptedPrompter) -> ScriptedPrompter,
+        check: &dyn Fn(&str),
+    ) {
+        let base = tempfile::tempdir().unwrap();
+        let (cfg, store) = pulled(base.path(), t0);
+        let pulled_text = format!("{t0}{HOSTILE}");
+        let files = disk(base.path());
+        let keys = store.snapshot();
+
+        // Declined: nothing asked after it, nothing changed, no new record.
+        let no = answers(ScriptedPrompter::new().with_confirm(false));
+        let left = no.remaining() - 1;
+        let err = run(&ctx_of(&cfg, &store, &no)).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "not changed: you did not trust namespace \"dev\"; nothing was changed"
+        );
+        assert_change_confirmation_first(&no, true);
+        assert_eq!(no.asked().len(), 1);
+        assert_eq!(no.remaining(), left);
+        assert_eq!(disk(base.path()), files);
+        assert_eq!(store.snapshot(), keys);
+        assert!(!trusted(&cfg, &pulled_text));
+
+        // No terminal: the same.
+        assert!(run(&ctx_for(&cfg, &store, &NoTerminal)).is_err());
+        assert_eq!(disk(base.path()), files);
+        assert_eq!(store.snapshot(), keys);
+
+        // Accepted: changed, and the result is trusted.
+        let yes = answers(ScriptedPrompter::new().with_confirm(true));
+        run(&ctx_of(&cfg, &store, &yes)).unwrap();
+        assert_change_confirmation_first(&yes, true);
+        assert_eq!(yes.remaining(), 0);
+        let now = std::fs::read_to_string(cfg.dir().join("dev.toml")).unwrap();
+        assert!(now.contains(HOSTILE.trim_end()), "{now}");
+        check(&now);
+        assert!(trusted(&cfg, &now));
+        activates_quietly(&cfg, &store);
+    }
+
+    #[test]
+    fn mutating_a_changed_project_file_confirms_first_set_vars() {
+        pulled_case(
+            T0,
+            &|ctx| set_vars(ctx, "dev", &[pv("REGION", "us"), sec("NEW")]),
+            &|p| p.with_secret("n-1"),
+            &|now| assert!(now.contains("REGION = \"us\"") && now.contains("NEW = ")),
+        );
+    }
+
+    #[test]
+    fn mutating_a_changed_project_file_confirms_first_edit() {
+        pulled_case(
+            T0,
+            &|ctx| {
+                edit(ctx, "dev", &|path: &Path| {
+                    let text = std::fs::read_to_string(path)?;
+                    std::fs::write(path, text.replace("\"eu\"", "\"us\""))?;
+                    Ok(())
+                })
+                .map(|_| ())
+            },
+            &|p| p,
+            &|now| assert!(now.contains("REGION = \"us\""), "{now}"),
+        );
+    }
+
+    #[test]
+    fn mutating_a_changed_project_file_confirms_first_link() {
+        pulled_case(T0, &|ctx| link::link(ctx, "dev", "aws"), &|p| p, &|now| {
+            assert!(now.contains("link = \"aws\""), "{now}")
+        });
+    }
+
+    #[test]
+    fn mutating_a_changed_project_file_confirms_first_unlink() {
+        pulled_case(LINKED_T0, &|ctx| link::unlink(ctx, "dev"), &|p| p, &|now| {
+            assert!(!now.contains("link"), "{now}")
+        });
+    }
+
+    #[test]
+    fn an_untrusted_never_seen_file_is_confirmed_before_a_change() {
+        let base = tempfile::tempdir().unwrap();
+        let cfg = checkout(base.path(), "a", T0);
+        let store = MemoryStore::default();
+        store.set(PKEY, "TOKEN", &Secret::new("t".into())).unwrap();
+        let no = ScriptedPrompter::new().with_confirm(false);
+        assert!(set_vars(&ctx_of(&cfg, &store, &no), "dev", &[pv("REGION", "us")]).is_err());
+        assert_change_confirmation_first(&no, false);
+        assert_eq!(
+            std::fs::read_to_string(cfg.dir().join("dev.toml")).unwrap(),
+            T0
+        );
+        assert!(!base.path().join("user/trust").exists());
+
+        let yes = ScriptedPrompter::new().with_confirm(true);
+        set_vars(&ctx_of(&cfg, &store, &yes), "dev", &[pv("REGION", "us")]).unwrap();
+        assert_change_confirmation_first(&yes, false);
+        let now = std::fs::read_to_string(cfg.dir().join("dev.toml")).unwrap();
+        assert_eq!(now, "[vars]\nREGION = \"us\"\nTOKEN = \"@keychain\"\n");
+        assert!(trusted(&cfg, &now));
+        activates_quietly(&cfg, &store);
+    }
+
+    #[test]
+    fn an_already_trusted_file_is_changed_without_a_question_and_stays_trusted() {
+        let base = tempfile::tempdir().unwrap();
+        let cfg = checkout(base.path(), "a", T0);
+        let store = MemoryStore::default();
+        store.set(PKEY, "TOKEN", &Secret::new("t".into())).unwrap();
+        record_trust(
+            &ctx_of(&cfg, &store, &ScriptedPrompter::new()),
+            &cfg.load("dev").unwrap(),
+        )
+        .unwrap();
+        let quiet = ScriptedPrompter::new();
+        set_vars(&ctx_of(&cfg, &store, &quiet), "dev", &[pv("REGION", "us")]).unwrap();
+        assert!(quiet.asked().is_empty());
+        activates_quietly(&cfg, &store);
+    }
+
+    #[test]
+    fn a_failed_apply_records_no_trust() {
+        let base = tempfile::tempdir().unwrap();
+        let cfg = checkout(base.path(), "a", T0);
+        let store = FailingSet {
+            inner: MemoryStore::default(),
+            fail_on: "NEW",
+        };
+        let prompt = ScriptedPrompter::new()
+            .with_confirm(true)
+            .with_secret("n-1");
+        let ctx = Ctx {
+            cfg: &cfg,
+            store: &store,
+            prompt: &prompt,
+        };
+        assert!(set_vars(&ctx, "dev", &[sec("NEW")]).is_err());
+        assert_eq!(prompt.remaining(), 0);
+        assert_eq!(
+            std::fs::read_to_string(cfg.dir().join("dev.toml")).unwrap(),
+            T0
+        );
+        assert!(store.inner.snapshot().is_empty());
+        assert!(!base.path().join("user/trust").exists());
+    }
+
+    #[test]
+    fn user_level_mutations_never_confirm() {
+        let (dir, cfg) = config_with(&[("work", "[vars]\nA = \"x\"\n")]);
+        let store = MemoryStore::default();
+        let none = ScriptedPrompter::new();
+        let ctx = ctx_of(&cfg, &store, &none);
+        set_vars(&ctx, "work", &[pv("A", "y")]).unwrap();
+        edit(&ctx, "work", &|path: &Path| {
+            std::fs::write(path, "[vars]\nA = \"z\"\n")?;
+            Ok(())
+        })
+        .unwrap();
+        link::link(&ctx, "work", "grp").unwrap();
+        link::unlink(&ctx, "work").unwrap();
+        assert!(none.asked().is_empty());
+        assert_eq!(read(&dir, "work"), "[vars]\nA = \"z\"\n");
+        assert!(!dir.path().join("trust").exists());
+    }
+
+    #[test]
+    fn a_change_trusts_only_the_namespace_the_user_changed() {
+        let base = tempfile::tempdir().unwrap();
+        let cfg = project_cfg(base.path(), "acme/api");
+        std::fs::create_dir_all(cfg.dir()).unwrap();
+        let a = "link = \"aws\"\n[vars]\nNODE_OPTIONS = \"\"\n";
+        let b = "link = \"aws\"\n[vars]\nNODE_OPTIONS = \"--require /tmp/x.js\"\n";
+        std::fs::write(cfg.dir().join("a.toml"), a).unwrap();
+        std::fs::write(cfg.dir().join("b.toml"), b).unwrap();
+        let store = MemoryStore::default();
+        record_trust(
+            &ctx_of(&cfg, &store, &ScriptedPrompter::new()),
+            &cfg.load("a").unwrap(),
+        )
+        .unwrap();
+        // `a` is trusted, so the only question is b's value for NEW.
+        let prompt = ScriptedPrompter::new().with_plain("2");
+        set_vars(&ctx_of(&cfg, &store, &prompt), "a", &[pv("NEW", "1")]).unwrap();
+        assert_eq!(prompt.remaining(), 0);
+        assert!(matches!(&prompt.asked()[..], [Asked::Plain { .. }]));
+        let b_now = cfg.load("b").unwrap().text();
+        assert!(b_now.contains("NEW = \"2\""), "{b_now}");
+        // `a` loads with no question; `b` was never confirmed, so it asks.
+        let quiet = ScriptedPrompter::new();
+        activate(&ctx_of(&cfg, &store, &quiet), "a", &ActiveState::default()).unwrap();
+        assert!(quiet.asked().is_empty());
+        let ask = ScriptedPrompter::new().with_confirm(false);
+        assert!(activate(&ctx_of(&cfg, &store, &ask), "b", &ActiveState::default()).is_err());
+        assert!(
+            matches!(&ask.asked()[..], [Asked::Confirm(t)] if t.contains("--require /tmp/x.js")),
+            "{:?}",
+            ask.asked()
+        );
+    }
+
+    #[test]
+    fn confirmation_precedes_the_editor() {
+        let base = tempfile::tempdir().unwrap();
+        let cfg = checkout(base.path(), "a", T0);
+        let store = MemoryStore::default();
+        store.set(PKEY, "TOKEN", &Secret::new("t".into())).unwrap();
+        // Declined: the editor never runs.
+        let no = ScriptedPrompter::new().with_confirm(false);
+        assert!(edit(&ctx_of(&cfg, &store, &no), "dev", &never_runs).is_err());
+        assert_eq!(no.asked().len(), 1);
+        // Accepted: the editor runs only once the question was answered.
+        let yes = ScriptedPrompter::new().with_confirm(true);
+        let answered_before_editor = std::cell::Cell::new(false);
+        edit(&ctx_of(&cfg, &store, &yes), "dev", &|_: &Path| {
+            answered_before_editor.set(yes.asked().len() == 1 && yes.remaining() == 0);
+            Ok(())
+        })
+        .unwrap();
+        assert!(answered_before_editor.get());
+        // Nothing was edited, but the confirmed file is now trusted.
+        assert!(trusted(&cfg, T0));
+    }
+
+    #[test]
+    fn trust_errors_name_the_purpose() {
+        let base = tempfile::tempdir().unwrap();
+        let cfg = checkout(base.path(), "a", T0);
+        let file = cfg.load("dev").unwrap();
+        let store = MemoryStore::default();
+        let cases = [
+            (
+                Purpose::Load,
+                "not loaded: you did not trust namespace \"dev\"; nothing was changed",
+                "project namespace \"dev\" is not trusted yet and needs a terminal to review it \
+                 (run envy dev in a terminal); nothing was changed",
+            ),
+            (
+                Purpose::Copy,
+                "not copied: you did not trust namespace \"dev\"; nothing was copied",
+                "project namespace \"dev\" is not trusted yet and needs a terminal to review it \
+                 (run the command again in a terminal); nothing was copied",
+            ),
+            (
+                Purpose::Change,
+                "not changed: you did not trust namespace \"dev\"; nothing was changed",
+                "project namespace \"dev\" is not trusted yet and needs a terminal to review it \
+                 (run the command again in a terminal to review the namespace first); \
+                 nothing was changed",
+            ),
+        ];
+        for (purpose, declined, no_terminal) in cases {
+            let no = ScriptedPrompter::new().with_confirm(false);
+            let err = check_trust_for(&ctx_of(&cfg, &store, &no), &file, purpose).unwrap_err();
+            assert_eq!(err.to_string(), declined);
+            let err =
+                check_trust_for(&ctx_for(&cfg, &store, &NoTerminal), &file, purpose).unwrap_err();
+            assert_eq!(err.to_string(), no_terminal);
+        }
+        assert!(!base.path().join("user/trust").exists());
+    }
+
+    #[test]
+    fn create_rejects_a_mismatched_source_pair() {
+        let base = tempfile::tempdir().unwrap();
+        let source = checkout(base.path(), "a", SRC);
+        let src_file = source.load("dev").unwrap();
+        let user = Config::new(base.path().join("u"));
+        let other = project_cfg(&base.path().join("b"), "acme/web");
+        let store = MemoryStore::default();
+        for (cfg, label) in [(&user, "user-level config"), (&other, "other project")] {
+            // Would succeed if the pair were trusted as given.
+            let p = ScriptedPrompter::new().with_secret("x");
+            let err = create(
+                &ctx_of(&user, &store, &p),
+                "new",
+                Some((cfg, &src_file)),
+                None,
+            )
+            .unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("was not loaded from the given config"),
+                "{label}: {err:#}"
+            );
+            assert!(p.asked().is_empty(), "{label}");
+            assert!(!user.present("new").unwrap(), "{label}");
+        }
+        assert!(store.snapshot().is_empty());
+    }
+
+    #[test]
+    fn project_set_and_edit_labels_name_the_project() {
+        let base = tempfile::tempdir().unwrap();
+        let cfg = checkout(base.path(), "a", T0);
+        let store = MemoryStore::default();
+        store.set(PKEY, "TOKEN", &Secret::new("t".into())).unwrap();
+        record_trust(
+            &ctx_of(&cfg, &store, &ScriptedPrompter::new()),
+            &cfg.load("dev").unwrap(),
+        )
+        .unwrap();
+        let shown = "dev (project acme/api)";
+        let p = ScriptedPrompter::new().with_plain("us").with_secret("n-1");
+        set_vars(
+            &ctx_of(&cfg, &store, &p),
+            "dev",
+            &[pl("REGION"), sec("NEW")],
+        )
+        .unwrap();
+        assert_eq!(
+            p.asked(),
+            vec![
+                Asked::Plain {
+                    label: plain_label("REGION", shown),
+                    default: Some("eu".into()),
+                },
+                Asked::Secret(secret_label("NEW", shown)),
+            ]
+        );
+        let p = ScriptedPrompter::new().with_secret("m-1");
+        edit(&ctx_of(&cfg, &store, &p), "dev", &|path: &Path| {
+            let text = std::fs::read_to_string(path)?;
+            std::fs::write(path, format!("{text}MORE = \"@keychain\"\n"))?;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(p.asked(), vec![Asked::Secret(secret_label("MORE", shown))]);
     }
 }

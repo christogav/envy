@@ -7,7 +7,9 @@ use std::collections::BTreeMap;
 
 use anyhow::{Context, Result, anyhow, bail};
 
-use crate::commands::{Change, Ctx, apply};
+use crate::commands::{
+    Change, Ctx, apply, check_trust_for_change, display_ns, record_trust_after_change,
+};
 use crate::config::{Config, NamespaceFile, Value};
 use crate::names::validate_namespace;
 use crate::prompt::{plain_label, secret_label};
@@ -342,7 +344,7 @@ pub(crate) fn fill_missing(
     secrets: &mut Vec<(String, Secret)>,
 ) -> Result<()> {
     let ns = file.name().to_string();
-    let shown = crate::commands::display_ns(ctx.cfg, &ns);
+    let shown = display_ns(ctx.cfg, &ns);
     for (name, secret) in names {
         let nothing = || format!("no value for {name} in {ns:?}; nothing was changed");
         if *secret {
@@ -425,6 +427,11 @@ fn check_join_with(
 /// refused if it has extra names or a name of the other kind. Linking to the
 /// group it is already in re-runs that check, which repairs drift. Nothing is
 /// written if `ns` or a member of the group changed while prompting.
+///
+/// At project level, once the arguments and the group are checked, `ns`'s
+/// current contents must be trusted or confirmed before any prompt; the
+/// result (only `ns`: no other member is written) is then recorded as
+/// trusted.
 pub fn link(ctx: &Ctx, ns: &str, group: &str) -> Result<()> {
     validate_namespace(ns)?;
     validate_namespace(group)?;
@@ -438,14 +445,17 @@ pub fn link(ctx: &Ctx, ns: &str, group: &str) -> Result<()> {
     }
     let group_others = members_except(ctx.cfg, group, ns)?;
     let missing = check_join_with(&before, group, &group_others)?;
+    check_trust_for_change(ctx, &before)?;
     if before.link() == Some(group) && missing.is_empty() {
-        return Ok(());
+        // Nothing to write; the file as it is was trusted or just confirmed.
+        return record_trust_after_change(ctx, &before);
     }
     let mut file = before.clone();
     let mut secrets: Vec<(String, Secret)> = Vec::new();
     fill_missing(ctx, &mut file, &missing, &mut secrets)?;
     file.set_link(Some(group))?;
     ensure_unchanged(ctx.cfg, &before, Some(group), &group_others)?;
+    let saved = file.clone();
     apply(
         ctx,
         vec![Change {
@@ -454,20 +464,36 @@ pub fn link(ctx: &Ctx, ns: &str, group: &str) -> Result<()> {
             secrets,
             delete: Vec::new(),
         }],
-    )
+    )?;
+    record_trust_after_change(ctx, &saved)
 }
 
 /// Takes `ns` out of its link group, keeping its variables. Unlinking a
 /// namespace that is not linked is an error, so a typo is not silently
-/// accepted.
+/// accepted. At project level `ns`'s current contents must be trusted or
+/// confirmed first, and the result is then recorded as trusted. Nothing is
+/// written if `ns` changed while the confirmation was shown.
 pub fn unlink(ctx: &Ctx, ns: &str) -> Result<()> {
     validate_namespace(ns)?;
-    let mut file = ctx.cfg.load(ns)?;
-    if file.link().is_none() {
+    let before = ctx.cfg.load(ns)?;
+    if before.link().is_none() {
         bail!("namespace {ns:?} is not in a link group");
     }
+    check_trust_for_change(ctx, &before)?;
+    let mut file = before.clone();
     file.set_link(None)?;
-    ctx.cfg.save(&file)
+    ensure_unchanged(ctx.cfg, &before, None, &[])?;
+    let saved = file.clone();
+    apply(
+        ctx,
+        vec![Change {
+            file,
+            before: Some(before),
+            secrets: Vec::new(),
+            delete: Vec::new(),
+        }],
+    )?;
+    record_trust_after_change(ctx, &saved)
 }
 
 #[cfg(test)]
@@ -1661,5 +1687,118 @@ mod tests {
         assert!(create(&ctx(&cfg, &failing, &prompt), "n", None, Some("aws")).is_err());
         assert_eq!(texts(&dir), before.0);
         assert_eq!(failing.inner.snapshot(), vec![entry("a", "TOKEN", "ta")]);
+    }
+
+    /// Every file under `dir` (recursively) with its text.
+    fn tree(dir: &std::path::Path) -> Vec<(PathBuf, String)> {
+        let mut out = Vec::new();
+        let mut todo = vec![dir.to_path_buf()];
+        while let Some(d) = todo.pop() {
+            let Ok(entries) = std::fs::read_dir(&d) else {
+                continue;
+            };
+            for e in entries {
+                let path = e.unwrap().path();
+                if path.is_dir() {
+                    todo.push(path);
+                } else {
+                    let text = std::fs::read_to_string(&path).unwrap();
+                    out.push((path, text));
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn link_groups_do_not_span_levels() {
+        let base = tempfile::tempdir().unwrap();
+        let user_dir = base.path().join("user");
+        std::fs::create_dir_all(&user_dir).unwrap();
+        let user = Config::new(user_dir.clone());
+        let proj = Config::project(
+            base.path().join("proj/.envy"),
+            base.path().join("proj"),
+            "acme/api".into(),
+            user_dir.clone(),
+        );
+        std::fs::create_dir_all(proj.dir()).unwrap();
+        for (cfg, a, b, var) in [(&user, "u1", "u2", "U"), (&proj, "p1", "p2", "P")] {
+            for n in [a, b] {
+                std::fs::write(
+                    cfg.dir().join(format!("{n}.toml")),
+                    format!("link = \"aws\"\n[vars]\n{var} = \"1\"\n"),
+                )
+                .unwrap();
+            }
+        }
+        let names = |cfg: &Config| -> Vec<String> {
+            members(cfg, "aws")
+                .unwrap()
+                .iter()
+                .map(|f| f.name().to_string())
+                .collect()
+        };
+        assert_eq!(names(&proj), ["p1", "p2"]);
+        assert_eq!(names(&user), ["u1", "u2"]);
+        let store = MemoryStore::default();
+        crate::commands::record_trust(
+            &ctx(&proj, &store, &ScriptedPrompter::new()),
+            &proj.load("p1").unwrap(),
+        )
+        .unwrap();
+
+        // A project change propagates to the project member only.
+        let user_before = tree(&user_dir);
+        let p = ScriptedPrompter::new().with_secret("s1").with_secret("s2");
+        set_vars(&ctx(&proj, &store, &p), "p1", &[sec("NEW")]).unwrap();
+        assert_eq!(p.remaining(), 0);
+        assert_eq!(
+            p.asked(),
+            vec![
+                Asked::Secret(secret_label("NEW", "p1 (project acme/api)")),
+                Asked::Secret(secret_label("NEW", "p2 (project acme/api)")),
+            ]
+        );
+        assert!(proj.load("p2").unwrap().text().contains("NEW"));
+        assert_eq!(
+            store.snapshot(),
+            vec![
+                entry("project/acme/api/p1", "NEW", "s1"),
+                entry("project/acme/api/p2", "NEW", "s2"),
+            ]
+        );
+        // The user level (its files, and every trust record but p1's) is
+        // untouched.
+        let trust_dir = user_dir.join("trust");
+        let strip = |t: Vec<(PathBuf, String)>| -> Vec<(PathBuf, String)> {
+            t.into_iter()
+                .filter(|(p, _)| !p.starts_with(&trust_dir))
+                .collect()
+        };
+        assert_eq!(strip(tree(&user_dir)), strip(user_before));
+
+        // A user change propagates to the user member only.
+        let proj_before = tree(&base.path().join("proj"));
+        let trust_before = tree(&trust_dir);
+        let keys_before = store.snapshot();
+        let p = ScriptedPrompter::new().with_secret("s3").with_secret("s4");
+        set_vars(&ctx(&user, &store, &p), "u1", &[sec("NEW")]).unwrap();
+        assert_eq!(p.remaining(), 0);
+        assert_eq!(
+            p.asked(),
+            vec![
+                Asked::Secret(secret_label("NEW", "u1")),
+                Asked::Secret(secret_label("NEW", "u2")),
+            ]
+        );
+        assert_eq!(tree(&base.path().join("proj")), proj_before);
+        assert_eq!(tree(&trust_dir), trust_before);
+        let mut expected = keys_before;
+        expected.extend([entry("u1", "NEW", "s3"), entry("u2", "NEW", "s4")]);
+        expected.sort();
+        assert_eq!(store.snapshot(), expected);
+        assert!(user.load("u2").unwrap().text().contains("NEW"));
     }
 }

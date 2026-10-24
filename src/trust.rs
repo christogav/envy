@@ -173,6 +173,9 @@ pub enum Purpose {
     Load,
     /// Copy the names and plain values into a new namespace (`--new --like`).
     Copy,
+    /// Change the namespace (`--secret`, `--plain`, `--edit`, `--link`,
+    /// `--unlink`) and record the result as trusted.
+    Change,
 }
 
 /// [`confirmation_text`] for a given purpose: only the closing line differs.
@@ -214,6 +217,7 @@ pub fn confirmation_text_for(
     out.push_str(match purpose {
         Purpose::Load => "\nAllow envy to load these variables into your current shell",
         Purpose::Copy => "\nAllow envy to copy these names and plain values into a new namespace",
+        Purpose::Change => "\nAllow envy to change this namespace, and trust the result",
     });
     out
 }
@@ -421,6 +425,15 @@ mod tests {
             load.rsplit_once("\n\n").unwrap().0,
             copy.rsplit_once("\n\n").unwrap().0
         );
+        let change = confirmation_text_for(&cfg, &file, &[], Purpose::Change);
+        assert_eq!(
+            change.rsplit_once("\n\n").unwrap(),
+            (
+                load.rsplit_once("\n\n").unwrap().0,
+                "Allow envy to change this namespace, and trust the result"
+            )
+        );
+        assert!(!change.contains('?') && !change.contains("[y/N]"));
     }
 
     #[test]
