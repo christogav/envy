@@ -183,7 +183,9 @@ GITHUB_TOKEN = "@keychain"  # secret: the value is in the Keychain
 - Variable names must be valid shell identifiers. Names that zsh treats
   specially (`PATH`, `HOME`, `IFS`, `SECONDS`, `UID`, the `PS*` prompts, ...),
   plus `SHELL`, `USER` and anything starting `DYLD_` or `LD_`, are refused,
-  because exporting them would break or hijack your shell.
+  because exporting them would break or hijack your shell. Every name
+  starting `ENVY_` is refused too: that prefix is reserved for envy's own
+  settings (`ENVY_CONFIG_DIR`, `ENVY_EVAL`) and shell state.
 
 ## Linked namespaces
 
@@ -319,9 +321,15 @@ So every clone of a project on your machine, and every fork (with `upstream`
 pointing at the original), shares one set of secrets: that is the point, and
 you are not asked for them again. The confirmation shows the identity and
 which secrets are already in your Keychain, so you can see when that happens.
-Nothing committed to the repository can choose the identity: it comes only
-from your local git remotes and the path. A dotfiles repository in your home
-directory does not lend its identity to folders under it.
+The identity comes from the folder's own **local** git configuration
+(`.git/config`), not from any file the repository commits. But a folder you
+copied or unzipped that includes its own `.git/` brings its remotes with it,
+so it can claim any `org/project`, and once you say yes its namespace reads
+that project's secrets you already have. The confirmation shows the identity
+and which secrets already exist (with a caution line when they were saved
+from another checkout): say yes only if this folder really is that project.
+A dotfiles repository in your home directory does not lend its identity to
+folders under it, and a `.git` owned by another account is ignored.
 
 Project secrets are Keychain items with service `envy.project/<identity>/<ns>`
 (for example `envy.project/acme/api/dev`), account = the variable name. Every
@@ -343,7 +351,15 @@ question; envy then tells you which ones it kept.
 
 - `HOME` must be set: it is where the search stops.
 - A `.envy` that is a symlink is ignored, so a repository can't point envy at
-  another folder.
+  another folder, and so is a `.envy` owned by another account (someone could
+  plant one in a shared folder such as `/tmp` or `/Users/Shared`). Each one
+  ignored gets a note on stderr, for example
+  `note: ignoring /Users/Shared/.envy: it is not owned by you` or
+  `note: ignoring /Users/you/src/api/.envy: it is a symlink`. A `.envy` folder
+  that is your own config directory (`ENVY_CONFIG_DIR`) is your level, never a
+  project level.
+- A project file must be a regular file of at most 1 MiB; a FIFO, a device
+  or a bigger file is an error.
 - A project file that doesn't parse (or isn't a regular file) is an error, never
   a silent fallback to your own namespace of the same name; use `--user` to
   reach yours.
@@ -366,7 +382,12 @@ question; envy then tells you which ones it kept.
 - **From a project you cloned.** A project namespace never loads, and is never
   trusted, without a confirmation that shows every variable and value; a
   changed file or a new checkout asks again, and with no terminal it is an
-  error (see [Project config](#project-config)).
+  error (see [Project config](#project-config)). Until you agree, envy only
+  checks which secrets exist and reads none of them, so macOS's own Keychain
+  access dialog never comes before envy's question.
+- **From its own settings.** A namespace file can't set any variable starting
+  `ENVY_`, so a project file can't redirect your config directory or trust
+  records, or switch off the guard that keeps exports away from a terminal.
 
 **What it does not protect**
 
