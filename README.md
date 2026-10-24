@@ -96,7 +96,28 @@ Secret values live only in the Keychain.
 
 ## Install
 
-You need macOS, zsh and a Rust toolchain.
+You need macOS (Apple Silicon or Intel) and zsh.
+
+```console
+$ brew install christogav/tap/envy
+```
+
+Then add this line to `~/.zshrc` and open a new shell:
+
+```zsh
+eval "$(envy --init zsh)"
+```
+
+The line is required: it defines the shell function above. If you run the
+binary directly it refuses to print anything that could expose secrets.
+
+The binaries aren't signed with an Apple Developer ID, so after an upgrade
+macOS may ask once whether `envy` can read your Keychain items again. That is
+expected.
+
+### From source
+
+You need a Rust toolchain.
 
 ```console
 $ cargo install --git https://github.com/christogav/envy
@@ -111,15 +132,6 @@ $ cargo install --path .
 If `envy` isn't found afterwards, make sure cargo's bin directory is on your
 `PATH`, or install somewhere that already is, for example
 `cargo install --path . --root ~/.local`.
-
-Then add this line to `~/.zshrc` and open a new shell:
-
-```zsh
-eval "$(envy --init zsh)"
-```
-
-The line is required: it defines the shell function above. If you run the
-binary directly it refuses to print anything that could expose secrets.
 
 ## Usage
 

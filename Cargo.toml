@@ -3,6 +3,9 @@ name = "envy"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
+description = "Load Keychain secrets and variables into your current zsh shell, by namespace"
+homepage = "https://github.com/christogav/envy"
+repository = "https://github.com/christogav/envy"
 
 [dependencies]
 anyhow = "1.0.104"
@@ -13,3 +16,8 @@ security-framework = "3.7.0"
 sha2 = "0.11.1"
 tempfile = "3.27.0"
 toml_edit = "0.25.17"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
