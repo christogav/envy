@@ -14,3 +14,4 @@ targets = ["aarch64-apple-darwin", "x86_64-apple-darwin"]
 # Where the Homebrew formula is published, and the job that pushes it
 tap = "christogav/homebrew-tap"
 publish-jobs = ["homebrew"]
+dispatch-releases = true
