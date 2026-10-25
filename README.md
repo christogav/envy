@@ -155,7 +155,7 @@ any name (even `off` or `new`).
 | `envy <ns> --list` (`--ls`) | Show the variables in `<ns>`: a `source:` line (`project (<file>)` or `user`), its link group, and each variable's value: plain values quoted (control characters escaped), secrets as `@keychain`, never their value. Nothing is read from the Keychain. |
 | `envy <ns>` | Add `<ns>` to what is already loaded (see [Stacking](#stacking)). A namespace linked to an active one replaces it; one that is already active is reloaded and moved to the top. |
 | `envy --off` | Remove every active namespace: unset all the variables envy set. |
-| `envy --off <ns>`, `envy <ns> --off` | Remove just `<ns>`. A variable it was shadowing gets the value from the next namespace that sets it. An error if `<ns>` is not active. |
+| `envy --off <ns>`, `envy <ns> --off` | Remove just `<ns>`. A variable it was winning gets its value back from the next namespace that sets it. An error if `<ns>` is not active. |
 | `envy <ns> --new` | Create an empty namespace: in the nearest project `.envy/` folder if there is one, otherwise your own. |
 | `envy <ns> --new --project` | Create the namespace in a project `.envy/` folder, making the folder if needed: at the git repository root inside a repository, otherwise in the current directory. Refused in your home directory or above it. |
 | `envy <ns> --user`, `envy <ns> ... --user` | Use your own `<ns>` even when the project has one with the same name. Works with every command that takes a namespace. |
@@ -204,8 +204,8 @@ $ envy --off                # nothing is left
 
 - **Removing one.** `envy --off <ns>` unsets the variables only `<ns>` set. A
   variable it was winning is set again to the value from the next namespace
-  that defines it (the Keychain is read again for that, as when loading). A
-  variable it was shadowing is left as it was.
+  that defines it (the Keychain is read again for that, as when loading); a
+  variable another namespace was winning is left as it was.
 - **Linked namespaces replace each other.** Namespaces in one [link
   group](#linked-namespaces) define the same variables, so they are
   alternatives: `envy personal-aws` while `work-aws` is loaded swaps one for the
@@ -224,13 +224,13 @@ $ envy --off                # nothing is left
   active (oldest first): common, web
   ```
 
-**Restoring.** To give a shadowed variable its value back, `--off <ns>` reads
+**Restoring.** To give a variable the removed namespace was winning its value back, `--off <ns>` reads
 the remaining namespaces again; envy never keeps secret values in your shell's
 state. So a restore never prompts, and never exports from a project file that
 is not trusted (changed since you confirmed it, or never confirmed for this
 checkout): those variables stay unset, and envy says which on stderr. A
 namespace loaded from a project folder you have since left cannot be read
-again either: its shadowed variables stay unset, and the message names the
+again either: the variables it was winning stay unset, and the message names the
 folder to run `envy --off <ns>` from. Plain `envy --off` always unsets
 everything.
 
