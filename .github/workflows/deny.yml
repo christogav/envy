@@ -1,0 +1,24 @@
+name: Dependency checks
+
+# Checks the dependency tree against the RustSec advisory database, the
+# licence allowlist and the allowed sources (see deny.toml). It also runs
+# daily: new advisories appear while the code sits unchanged.
+
+on:
+  # No path filter here: a required check that doesn't report blocks the PR.
+  pull_request:
+  push:
+    branches: [main]
+    paths: [Cargo.toml, Cargo.lock, deny.toml]
+  schedule:
+    - cron: "17 6 * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  cargo-deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
