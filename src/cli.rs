@@ -57,8 +57,12 @@ pub struct Command {
 /// Shown after the options in `--help`: what envy does, and the setup line.
 const AFTER_HELP: &str = "\
 envy keeps sets of environment variables, called namespaces, and loads one
-into the current shell with `envy <namespace>`, replacing the namespace loaded
-before (`envy --off` unloads it). Secrets live in the macOS Keychain; plain
+into the current shell with `envy <namespace>`. Namespaces stack: each one you
+load is added to those already loaded, and if two set the same variable the one
+loaded last wins, with a warning. A namespace linked to a loaded one replaces
+it instead, and loading a name again moves it to the top. `envy --off <name>`
+removes one namespace (a variable it was shadowing gets its value back from
+the next namespace that sets it); `envy --off` removes them all. Secrets live in the macOS Keychain; plain
 values and the names live in ~/.config/envy/<namespace>.toml (or in
 $ENVY_CONFIG_DIR). Run `envy --list` (or `envy` alone) to list the namespaces,
 and `envy <namespace> --list` (alias `--ls`) to show a namespace's variables:
@@ -91,7 +95,7 @@ struct Flags {
     /// Namespace to act on (comes first; may be named like a flag, e.g. `off`)
     namespace: Option<String>,
 
-    /// Remove every active namespace; with a namespace, remove only that one
+    /// Remove every active namespace; `--off NAME` (or `NAME --off`) removes only that one
     #[arg(long)]
     off: bool,
 
