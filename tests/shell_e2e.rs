@@ -65,7 +65,7 @@ fn stderr(out: &Output) -> String {
 }
 
 #[test]
-fn activate_then_switch_is_clean() {
+fn activate_then_add_stacks_and_off_clears_everything() {
     let dir = fixture();
     let out = zsh(
         dir.path(),
@@ -73,17 +73,37 @@ fn activate_then_switch_is_clean() {
 envy work
 print -r -- "$AWS_REGION|$TAG|$ENVY_ACTIVE"
 envy personal
-print -r -- "${AWS_REGION-unset}|$ONLY_PERSONAL"
+print -r -- "${AWS_REGION-unset}|$ONLY_PERSONAL|$ENVY_ACTIVE"
 envy --off
-print -r -- "${ONLY_PERSONAL-unset}|${ENVY_ACTIVE-unset}"
+print -r -- "${AWS_REGION-unset}|${ONLY_PERSONAL-unset}|${ENVY_ACTIVE-unset}"
 "#,
     );
     assert!(out.status.success(), "{}", stderr(&out));
     assert_eq!(
         stdout(&out),
-        "eu-west-1|it's $HOME|work\nunset|p\nunset|unset\n"
+        "eu-west-1|it's $HOME|work\neu-west-1|p|work personal\nunset|unset|unset\n"
     );
     assert_eq!(stderr(&out), "");
+}
+
+#[test]
+fn a_collision_warns_on_stderr_naming_names_only() {
+    let dir = fixture();
+    std::fs::write(
+        dir.path().join("eu.toml"),
+        "[vars]\nAWS_REGION = \"zq-other-region\"\n",
+    )
+    .unwrap();
+    let out = zsh(
+        dir.path(),
+        "envy work\nenvy eu\nprint -r -- \"$AWS_REGION|$TAG|$ENVY_ACTIVE\"\n",
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "zq-other-region|it's $HOME|work eu\n");
+    assert_eq!(
+        stderr(&out),
+        "warning: AWS_REGION is set by both \"work\" and \"eu\"; \"eu\" wins (it was activated last)\n"
+    );
 }
 
 #[test]

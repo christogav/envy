@@ -143,6 +143,29 @@ impl Levels {
         }
     }
 
+    /// Exactly these levels, for tests that need a project level without
+    /// discovering one.
+    #[cfg(test)]
+    pub fn with_projects(projects: Vec<Config>, user: Config) -> Levels {
+        Levels {
+            projects,
+            user,
+            notes: Vec::new(),
+        }
+    }
+
+    /// The level whose [`label`] is `source`: `user` for the user level, else
+    /// a project level discovered from here. `None` for anything else (a
+    /// project folder this run cannot see): the label comes from the
+    /// untrusted environment, so it is only ever compared, never used as a
+    /// path.
+    pub fn config_for(&self, source: &str) -> Option<&Config> {
+        if source == "user" {
+            return Some(&self.user);
+        }
+        self.projects.iter().find(|p| label(p) == source)
+    }
+
     /// The user's own level.
     pub fn user(&self) -> &Config {
         &self.user
@@ -427,6 +450,27 @@ mod tests {
             shadow_note("dev"),
             "note: project namespace \"dev\" shadows your user-level \"dev\"; use --user for yours"
         );
+    }
+
+    #[test]
+    fn config_for_finds_a_level_by_its_label_only() {
+        let f = fixture();
+        let cwd = f.mkdir("a/b");
+        fs::create_dir_all(f.home.join("a/.envy")).unwrap();
+        fs::create_dir_all(f.home.join("a/b/.envy")).unwrap();
+        let l = f.levels(&cwd);
+        assert!(!l.config_for("user").unwrap().is_project());
+        for project in l.projects() {
+            assert_eq!(l.config_for(&label(project)).unwrap().dir(), project.dir());
+        }
+        // A folder that is not discoverable from here, or a near miss.
+        let elsewhere = encode_path(&f.home.join("x/.envy"));
+        let raw_path = f.home.join("a/.envy").display().to_string() + "/";
+        for other in [elsewhere.as_str(), "", "User", raw_path.as_str()] {
+            assert!(l.config_for(other).is_none(), "{other}");
+        }
+        let outside = f.levels(&f.mkdir("plain"));
+        assert!(outside.config_for(&label(&l.projects()[0])).is_none());
     }
 
     #[test]

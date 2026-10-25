@@ -1,8 +1,14 @@
+//! The shell text envy prints for the wrapper's `eval`: the values of a
+//! namespace's variables, and the lines that move the shell from one state to
+//! the next.
+
+use std::collections::BTreeMap;
+
 use anyhow::{Context, Result, bail};
 
 use crate::config::{NamespaceFile, Value};
 use crate::quote::shell_quote;
-use crate::stack::ActiveState;
+use crate::stack::{ActiveState, Transition};
 use crate::store::SecretStore;
 
 fn unset_line(vars: &[String]) -> String {
@@ -13,48 +19,71 @@ fn unset_line(vars: &[String]) -> String {
     }
 }
 
-/// Renders the shell text that switches to `ns`: unset the previous
-/// variables, record the new state (a stack of one entry: `ns`, `source`, the
-/// label of the level `ns` was loaded from, and its variables), then export
-/// the new variables. Every secret is fetched before any
-/// output is built, so a failure returns `Err` with nothing emitted.
+/// The value of variable `name` (whose file value is `value`) of `ns`: a
+/// plain value as written, a secret from `store`, or `None` for a secret that
+/// is not in the store. A failed read is an error naming the variable only.
 ///
 /// `ns` must come from `Config::load`: a freshly parsed project file carries
 /// the default key and would read the user-level item with the same name.
-pub fn render_activate(
+pub fn read_value(
     ns: &NamespaceFile,
-    source: &str,
-    prev: &ActiveState,
+    name: &str,
+    value: &Value,
     store: &dyn SecretStore,
-) -> Result<String> {
-    let mut resolved: Vec<(String, String)> = Vec::new();
-    for (name, value) in ns.vars() {
-        let text = match value {
-            Value::Plain(text) => text,
-            Value::Secret => match store
-                .get(ns.secret_key(), &name)
-                .with_context(|| format!("cannot read secret {name} for namespace {}", ns.name()))?
-            {
-                Some(secret) => secret.expose().to_string(),
-                None => bail!(
-                    "secret {name} is missing from the Keychain for namespace {}",
-                    ns.name()
-                ),
-            },
-        };
-        resolved.push((name, text));
-    }
+) -> Result<Option<String>> {
+    Ok(match value {
+        Value::Plain(text) => Some(text.clone()),
+        Value::Secret => store
+            .get(ns.secret_key(), name)
+            .with_context(|| format!("cannot read secret {name} for namespace {}", ns.name()))?
+            .map(|secret| secret.expose().to_string()),
+    })
+}
 
-    // The state is recorded before the variables are exported: if the shell
-    // stops partway through the exports, ENVY_VARS already lists every name,
-    // so `envy --off` (or the next switch) still unsets whatever was set.
-    let mut out = unset_line(&prev.all_vars());
-    let names: Vec<&str> = resolved.iter().map(|(n, _)| n.as_str()).collect();
-    out.push_str(&ActiveState::single(ns.name(), Some(source), &names).state_exports());
-    for (name, text) in &resolved {
-        out.push_str(&format!("export {name}={}\n", shell_quote(text)));
+/// Every variable of `ns` with its value ([`read_value`]); a secret missing
+/// from the store is an error.
+pub fn read_values(
+    ns: &NamespaceFile,
+    store: &dyn SecretStore,
+) -> Result<BTreeMap<String, String>> {
+    let mut values = BTreeMap::new();
+    for (name, value) in ns.vars() {
+        let Some(text) = read_value(ns, &name, &value, store)? else {
+            bail!(
+                "secret {name} is missing from the Keychain for namespace {}",
+                ns.name()
+            );
+        };
+        values.insert(name, text);
     }
-    Ok(out)
+    Ok(values)
+}
+
+/// Renders the shell text for `t`: one `unset` line, then the next state,
+/// then an `export` per variable in `t.export`. The `unset` line holds
+/// `t.unset` and every variable of `t.export` that has no entry in `values`
+/// (one that could not be restored is left unset, never stale). Every value
+/// must already be in `values`, so nothing can fail once output is built.
+///
+/// The state is recorded before the variables are exported: if the shell
+/// stops partway through the exports, `ENVY_VARS` already lists every name,
+/// so `envy --off` (or the next change) still unsets whatever was set.
+pub fn render_transition(t: &Transition, values: &BTreeMap<String, String>) -> String {
+    let mut unset = t.unset.clone();
+    unset.extend(
+        t.export
+            .iter()
+            .filter(|e| !values.contains_key(&e.var))
+            .map(|e| e.var.clone()),
+    );
+    let mut out = unset_line(&unset);
+    out.push_str(&t.next.state_exports());
+    for e in &t.export {
+        if let Some(text) = values.get(&e.var) {
+            out.push_str(&format!("export {}={}\n", e.var, shell_quote(text)));
+        }
+    }
+    out
 }
 
 /// Renders the shell text that deactivates whatever `prev` describes.
@@ -70,6 +99,7 @@ pub fn render_off(prev: &ActiveState) -> String {
 mod tests {
     use super::*;
     use crate::secret::Secret;
+    use crate::stack::{Change, Entry, transition};
     use crate::store::MemoryStore;
 
     fn state(vars: &[&str]) -> ActiveState {
@@ -90,21 +120,42 @@ mod tests {
         store
     }
 
+    /// `work` (B, C) added to `prev`, replacing `replaces`.
+    fn add_work(prev: &ActiveState, replaces: &[&str]) -> Transition {
+        let change = Change::Add {
+            entry: Entry {
+                namespace: "work".into(),
+                source: Some("user".into()),
+                vars: vec!["B".into(), "C".into()],
+            },
+            replaces: replaces.iter().map(|r| r.to_string()).collect(),
+        };
+        transition(prev, &change).unwrap()
+    }
+
+    fn values(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
     #[test]
-    fn activate_emits_unsets_then_state_then_exports_exactly() {
-        let out = render_activate(&work(), "user", &state(&["A", "B"]), &store_with_c()).unwrap();
+    fn render_transition_unsets_then_records_state_then_exports_exactly() {
+        let t = add_work(&state(&["A", "B"]), &["old"]);
+        let out = render_transition(&t, &values(&[("B", "x"), ("C", "s3cret")]));
         assert_eq!(
             out,
             format!(
-                "unset A B\nexport ENVY_ACTIVE='work'\nexport ENVY_STACK='work{S}user{S}B C'\nexport ENVY_VARS='B C'\nunset ENVY_SOURCE\nexport B='x'\nexport C='s3cret'\n"
+                "unset A\nexport ENVY_ACTIVE='work'\nexport ENVY_STACK='work{S}user{S}B C'\nexport ENVY_VARS='B C'\nunset ENVY_SOURCE\nexport B='x'\nexport C='s3cret'\n"
             )
         );
     }
 
     #[test]
-    fn no_previous_state_emits_no_unset_line() {
-        let out =
-            render_activate(&work(), "user", &ActiveState::default(), &store_with_c()).unwrap();
+    fn nothing_to_unset_emits_no_unset_line() {
+        let t = add_work(&ActiveState::default(), &[]);
+        let out = render_transition(&t, &values(&[("B", "x"), ("C", "s3cret")]));
         assert_eq!(
             out,
             format!(
@@ -114,19 +165,24 @@ mod tests {
     }
 
     #[test]
-    fn a_project_source_is_recorded_before_the_exports_and_quoted() {
-        let out = render_activate(
-            &work(),
-            "/Users/me/src/it's api/.envy",
-            &ActiveState::default(),
-            &store_with_c(),
-        )
-        .unwrap();
-        assert_eq!(
-            out,
-            format!(
-                "export ENVY_ACTIVE='work'\nexport ENVY_STACK='work{S}/Users/me/src/it'\\''s api/.envy{S}B C'\nexport ENVY_VARS='B C'\nunset ENVY_SOURCE\nexport B='x'\nexport C='s3cret'\n"
-            )
+    fn an_export_without_a_value_is_unset_instead() {
+        let t = add_work(&state(&["A", "B"]), &["old"]);
+        let out = render_transition(&t, &values(&[("C", "s3cret")]));
+        assert!(out.starts_with("unset A B\nexport ENVY_ACTIVE="), "{out}");
+        assert!(
+            out.ends_with("unset ENVY_SOURCE\nexport C='s3cret'\n"),
+            "{out}"
+        );
+        assert!(!out.contains("export B="), "{out}");
+    }
+
+    #[test]
+    fn values_are_shell_quoted() {
+        let t = add_work(&ActiveState::default(), &[]);
+        let out = render_transition(&t, &values(&[("B", "it's $(id)"), ("C", "c")]));
+        assert!(
+            out.ends_with("export B='it'\\''s $(id)'\nexport C='c'\n"),
+            "{out}"
         );
     }
 
@@ -156,7 +212,7 @@ mod tests {
             "\u{7f}".to_string(),
         ] {
             let env = |k: &str| match k {
-                "ENVY_ACTIVE" => Some("work".to_string()),
+                "ENVY_ACTIVE" => Some("other".to_string()),
                 "ENVY_VARS" => Some("B C".to_string()),
                 "ENVY_SOURCE" => Some(bad.clone()),
                 _ => None,
@@ -164,7 +220,8 @@ mod tests {
             let prev = ActiveState::from_env(env);
             assert_eq!(prev.entries[0].source, None, "{bad:?}");
             // The previous source never reaches shell code.
-            let out = render_activate(&work(), "user", &prev, &store_with_c()).unwrap();
+            let t = add_work(&prev, &[]);
+            let out = render_transition(&t, &values(&[("B", "x"), ("C", "c")]));
             assert!(!out.contains("id)") && !out.contains("unset PATH"), "{out}");
             assert!(!render_off(&prev).contains("id)"));
         }
@@ -185,36 +242,15 @@ mod tests {
     }
 
     #[test]
-    fn values_are_shell_quoted() {
-        let ns = NamespaceFile::parse("w", "[vars]\nA = \"it's $(id)\"\n").unwrap();
-        let out = render_activate(
-            &ns,
-            "user",
-            &ActiveState::default(),
-            &MemoryStore::default(),
-        )
-        .unwrap();
-        assert!(out.ends_with("export A='it'\\''s $(id)'\n"), "{out}");
+    fn read_values_reads_plain_values_and_secrets() {
+        assert_eq!(
+            read_values(&work(), &store_with_c()).unwrap(),
+            values(&[("B", "x"), ("C", "s3cret")])
+        );
     }
 
     #[test]
-    fn reactivating_same_namespace_is_idempotent() {
-        let store = store_with_c();
-        let first = render_activate(&work(), "user", &ActiveState::default(), &store).unwrap();
-        let env = |k: &str| match k {
-            "ENVY_ACTIVE" => Some("work".to_string()),
-            "ENVY_SOURCE" => Some("user".to_string()),
-            "ENVY_VARS" => Some("B C".to_string()),
-            _ => None,
-        };
-        let prev = ActiveState::from_env(env);
-        assert_eq!(prev.all_vars(), ["B", "C"]);
-        let second = render_activate(&work(), "user", &prev, &store).unwrap();
-        assert_eq!(second, format!("unset B C\n{first}"));
-    }
-
-    #[test]
-    fn missing_keychain_item_emits_nothing() {
+    fn a_missing_keychain_item_fails_naming_it_only() {
         let ns = NamespaceFile::parse(
             "work",
             "[vars]\nB = \"@keychain\"\nC = \"@keychain\"\nD = \"plain\"\n",
@@ -224,7 +260,7 @@ mod tests {
         store
             .set("work", "B", &Secret::new("b-secret-value".into()))
             .unwrap();
-        let err = render_activate(&ns, "user", &state(&["A"]), &store).unwrap_err();
+        let err = read_values(&ns, &store).unwrap_err();
         let msg = format!("{err:#}");
         assert_eq!(
             msg,
@@ -282,7 +318,7 @@ mod tests {
     }
 
     #[test]
-    fn render_activate_reads_the_project_key() {
+    fn read_values_reads_the_project_key() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = crate::config::Config::project(
             dir.path().join(".envy"),
@@ -299,13 +335,15 @@ mod tests {
         store
             .set("work", "C", &Secret::new("user-level".into()))
             .unwrap();
-        let err = render_activate(&file, "user", &ActiveState::default(), &store).unwrap_err();
+        let err = read_values(&file, &store).unwrap_err();
         assert!(format!("{err:#}").contains("namespace work"), "{err:#}");
 
         store
             .set("project/acme/api/work", "C", &Secret::new("proj".into()))
             .unwrap();
-        let out = render_activate(&file, "user", &ActiveState::default(), &store).unwrap();
-        assert!(out.ends_with("export C='proj'\n"), "{out}");
+        assert_eq!(
+            read_values(&file, &store).unwrap(),
+            values(&[("C", "proj")])
+        );
     }
 }

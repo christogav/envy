@@ -116,7 +116,11 @@ fn run(command: Command) -> Result<String> {
             check_emit()?;
             let here = Here::discover()?;
             let cfg = here.resolve(&ns, scope)?;
-            commands::activate(&ctx(cfg), &ns, &active_state())
+            let activation = commands::activate(&ctx(cfg), &here.levels, &ns, &active_state())?;
+            for note in &activation.notes {
+                eprintln!("{note}");
+            }
+            Ok(activation.stdout)
         }
         Action::Status => commands::status(&Here::discover()?.levels, &active_state()),
         Action::List(ns) => {
