@@ -456,9 +456,10 @@ pub(crate) fn record_trust(ctx: &Ctx, file: &NamespaceFile) -> Result<()> {
 /// levels, each level gets a block, nearest project first and the user level
 /// last, introduced by `project: <its .envy folder>` (percent-encoded, as the
 /// path is the repository's to choose) or `user:`. A name that a nearer level
-/// already provides is marked ` (shadowed)`. The `*` marks the row that was
-/// loaded ([`is_active`]); when no row is that one, a last line says the
-/// active namespace no longer exists or was loaded from another folder.
+/// already provides is marked ` (shadowed)`. The `*` marks every row that was
+/// loaded ([`is_active`]); each active entry no row matches gets a line saying
+/// it no longer exists or was loaded from another folder. With more than one
+/// active, a last line gives the order, oldest first.
 pub fn status(levels: &Levels, active: &ActiveState) -> Result<String> {
     let entries = levels.entries()?;
     let level_label = |level: &Level| match level {
@@ -502,12 +503,18 @@ pub fn status(levels: &Levels, active: &ActiveState) -> Result<String> {
         out.push_str("user:\n");
         out.push_str(&block(&Level::User));
     }
-    if let Some(current) = active.entries.last()
-        && !entries
-            .iter()
-            .any(|e| e.name == current.namespace && starred(e))
-    {
+    for current in &active.entries {
         let ns = current.namespace.as_str();
+        let listed = entries.iter().any(|e| {
+            e.name == ns
+                && entry_matches(current, &e.name, &level_label(&e.level), e.shadowed, || {
+                    Ok(count(&e.name))
+                })
+                .unwrap_or(false)
+        });
+        if listed {
+            continue;
+        }
         // An old shell (no source) with an ambiguous name marks nothing and
         // adds nothing: the name does exist.
         let ambiguous = current.source.is_none() && count(ns) > 1;
@@ -521,27 +528,53 @@ pub fn status(levels: &Levels, active: &ActiveState) -> Result<String> {
             out.push_str(&format!("* {ns} (no longer exists)\n"));
         }
     }
+    if active.entries.len() > 1 {
+        let names: Vec<&str> = active
+            .entries
+            .iter()
+            .map(|e| e.namespace.as_str())
+            .collect();
+        out.push_str(&format!("active (oldest first): {}\n", names.join(", ")));
+    }
     if out.is_empty() {
         out.push_str("no namespaces yet; create one with: envy <name> --new\n");
     }
     Ok(out)
 }
 
-/// Whether namespace `name` at the level labelled `level` is the one the
-/// shell loaded. With `ENVY_SOURCE`, the name and the level must both match.
-/// A shell from before it existed records no level: then the unshadowed row
-/// of the name counts, but only if just one level has the name (`count`),
-/// since which one was loaded is unknown.
+/// Whether namespace `name` at the level labelled `level` is one the shell
+/// loaded: any active entry matches ([`entry_matches`]).
 fn is_active(
     active: &ActiveState,
     name: &str,
     level: &str,
     shadowed: bool,
+    count: impl Fn() -> Result<usize>,
+) -> Result<bool> {
+    for current in &active.entries {
+        if entry_matches(current, name, level, shadowed, &count)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Whether the active entry `current` is namespace `name` at the level
+/// labelled `level`. With a recorded source, the name and the level must both
+/// match (the label is compared, never used as a path). An entry from before
+/// sources were recorded has no level: then the unshadowed row of the name
+/// counts, but only if just one level has the name (`count`), since which one
+/// was loaded is unknown.
+fn entry_matches(
+    current: &crate::stack::Entry,
+    name: &str,
+    level: &str,
+    shadowed: bool,
     count: impl FnOnce() -> Result<usize>,
 ) -> Result<bool> {
-    let Some(current) = active.entries.last().filter(|e| e.namespace == name) else {
+    if current.namespace != name {
         return Ok(false);
-    };
+    }
     Ok(match current.source.as_deref() {
         Some(source) => source == level,
         None => !shadowed && count()? <= 1,
@@ -556,7 +589,7 @@ fn is_active(
 /// never be fetched, let alone printed. Plain values are quoted and escaped
 /// ([`quote_for_display`]) so they cannot disturb the terminal or the layout;
 /// a project file's path is percent-encoded for the same reason. `(active)`
-/// only when this level's `ns` is the one loaded ([`is_active`]).
+/// only when this level's `ns` is one of those loaded ([`is_active`]).
 pub fn list_vars(
     levels: &Levels,
     ns: &str,
@@ -1746,6 +1779,116 @@ mod tests {
         assert_eq!(
             status(&user_levels(&cfg), &active).unwrap(),
             "  work\n* gone (no longer exists)\n"
+        );
+    }
+
+    /// An `ActiveState` of entries, oldest first: `(namespace, source)`.
+    fn stacked(entries: &[(&str, Option<&str>)]) -> ActiveState {
+        ActiveState {
+            entries: entries
+                .iter()
+                .map(|(ns, src)| crate::stack::Entry {
+                    namespace: (*ns).to_string(),
+                    source: src.map(str::to_string),
+                    vars: vec!["A".to_string()],
+                })
+                .collect(),
+            extra_vars: vec![],
+        }
+    }
+
+    #[test]
+    fn status_marks_every_active_namespace() {
+        let (_tmp, home, levels) = nested_levels();
+        let outer = encode_path(&home.join("a/.envy"));
+        let active = stacked(&[("mine", Some("user")), ("ci", Some(&outer))]);
+        let out = status(&levels, &active).unwrap();
+        assert_eq!(
+            out,
+            format!(
+                "{}active (oldest first): mine, ci\n",
+                nested_body(&home, "  *  *")
+            )
+        );
+        // A legacy entry marks only an unambiguous name, alongside others.
+        let active = stacked(&[("web", None), ("dev", None), ("mine", Some("user"))]);
+        let out = status(&levels, &active).unwrap();
+        assert_eq!(
+            out,
+            format!(
+                "{}active (oldest first): web, dev, mine\n",
+                nested_body(&home, " *   *")
+            )
+        );
+    }
+
+    #[test]
+    fn status_lists_the_order_when_more_than_one() {
+        let (_dir, cfg) = config_with(&[("a", ""), ("b", ""), ("c", "")]);
+        let active = stacked(&[
+            ("c", Some("user")),
+            ("a", Some("user")),
+            ("b", Some("user")),
+        ]);
+        assert_eq!(
+            status(&user_levels(&cfg), &active).unwrap(),
+            "* a\n* b\n* c\nactive (oldest first): c, a, b\n"
+        );
+    }
+
+    #[test]
+    fn status_with_one_active_has_no_order_line() {
+        let (_dir, cfg) = config_with(&[("a", ""), ("b", "")]);
+        let out = status(&user_levels(&cfg), &act("a", Some("user"))).unwrap();
+        assert_eq!(out, "* a\n  b\n");
+        assert!(!out.contains("oldest first"), "{out}");
+    }
+
+    #[test]
+    fn status_reports_each_missing_or_foreign_entry() {
+        let (_dir, cfg) = config_with(&[("a", "")]);
+        let active = stacked(&[
+            ("gone", Some("user")),
+            ("a", Some("user")),
+            ("far", Some("/elsewhere/.envy")),
+        ]);
+        assert_eq!(
+            status(&user_levels(&cfg), &active).unwrap(),
+            "* a\n* gone (no longer exists)\n* far (from another folder)\n\
+             active (oldest first): gone, a, far\n"
+        );
+    }
+
+    #[test]
+    fn status_with_duplicate_entries_marks_a_row_once_and_does_not_panic() {
+        let (_dir, cfg) = config_with(&[("a", "")]);
+        let active = stacked(&[("a", Some("user")), ("a", Some("user"))]);
+        assert_eq!(
+            status(&user_levels(&cfg), &active).unwrap(),
+            "* a\nactive (oldest first): a, a\n"
+        );
+    }
+
+    #[test]
+    fn list_marks_active_for_any_matching_entry() {
+        let (_dir, cfg) = config_with(&[("dev", "[vars]\nA = \"1\"\n"), ("prod", "")]);
+        let levels = user_levels(&cfg);
+        let active = stacked(&[("dev", Some("user")), ("prod", Some("user"))]);
+        assert_eq!(
+            list_vars(&levels, "dev", false, &active).unwrap(),
+            "namespace: dev (active)\nsource: user\n\nA  \"1\"\n"
+        );
+        assert!(
+            list_vars(&levels, "prod", false, &active)
+                .unwrap()
+                .starts_with("namespace: prod (active)\n")
+        );
+        // Not active at this level: no mark.
+        let other = stacked(&[("dev", Some("/elsewhere/.envy")), ("x", Some("user"))]);
+        assert!(
+            list_vars(&levels, "dev", false, &other)
+                .unwrap()
+                .starts_with("namespace: dev\n")
         );
     }
 
