@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use anyhow::{Context, Result, bail};
-use envy::activate::{ActiveState, render_off};
+use envy::activate::render_off;
 use envy::cli::{self, Action, Command, Scope};
 use envy::commands::{self, Ctx};
 use envy::config::Config;
@@ -14,6 +14,7 @@ use envy::levels::{Levels, shadow_note};
 use envy::link;
 use envy::project::encode_path;
 use envy::prompt::TtyPrompter;
+use envy::stack::ActiveState;
 use envy::store::MacKeychain;
 
 /// Stops core dumps, which would write secrets held in memory to disk.
@@ -110,12 +111,34 @@ fn run(command: Command) -> Result<String> {
             check_emit()?;
             Ok(render_off(&active_state()))
         }
+        Action::OffNamed(ns) => {
+            // The output holds secret exports (restored values).
+            check_emit()?;
+            // Levels are only needed to restore a shadowed variable. If they
+            // cannot be discovered (say the current directory was deleted),
+            // fall back to the user level alone: project entries are then
+            // "not visible from here" and are never read.
+            let activation = commands::deactivate_lazy(&MacKeychain, &ns, &active_state(), || {
+                match Here::discover() {
+                    Ok(here) => Ok(here.levels),
+                    Err(_) => Ok(Levels::user_only(Config::from_env()?)),
+                }
+            })?;
+            for note in &activation.notes {
+                eprintln!("{note}");
+            }
+            Ok(activation.stdout)
+        }
         Action::Activate(ns) => {
             // Refuse before the config, the Keychain or the filesystem is read.
             check_emit()?;
             let here = Here::discover()?;
             let cfg = here.resolve(&ns, scope)?;
-            commands::activate(&ctx(cfg), &ns, &active_state())
+            let activation = commands::activate(&ctx(cfg), &here.levels, &ns, &active_state())?;
+            for note in &activation.notes {
+                eprintln!("{note}");
+            }
+            Ok(activation.stdout)
         }
         Action::Status => commands::status(&Here::discover()?.levels, &active_state()),
         Action::List(ns) => {

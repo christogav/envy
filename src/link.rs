@@ -502,10 +502,10 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use crate::activate::ActiveState;
-    use crate::commands::{SetItem, activate, create, set_vars};
+    use crate::commands::{SetItem, activate_here, create, set_vars};
     use crate::prompt::{Asked, Prompter, ScriptedPrompter};
     use crate::secret::Secret;
+    use crate::stack::ActiveState;
     use crate::store::{MemoryStore, SecretStore};
 
     fn config_with(files: &[(&str, &str)]) -> (tempfile::TempDir, Config) {
@@ -1555,7 +1555,7 @@ mod tests {
         let b = "link = \"aws\"\n\n[vars]\nREGION = \"us\"\n";
         let (_dir, cfg) = config_with(&[("a", SECRET_A), ("b", b)]);
         let store = store_with(&[("a", "TOKEN", "zq-secret")]);
-        let err = activate(
+        let err = activate_here(
             &ctx(&cfg, &store, &ScriptedPrompter::new()),
             "b",
             &ActiveState::default(),
@@ -1566,7 +1566,7 @@ mod tests {
             err.contains("missing TOKEN") && err.contains("--link"),
             "{err}"
         );
-        let err = activate(
+        let err = activate_here(
             &ctx(&cfg, &store, &ScriptedPrompter::new()),
             "a",
             &ActiveState::default(),
@@ -1581,7 +1581,7 @@ mod tests {
     fn aligned_linked_namespace_activates() {
         let (_dir, cfg) = config_with(&[("a", SECRET_A), ("b", SECRET_B)]);
         let store = store_with(&[("a", "TOKEN", "ta"), ("b", "TOKEN", "tb")]);
-        let out = activate(
+        let out = activate_here(
             &ctx(&cfg, &store, &ScriptedPrompter::new()),
             "b",
             &ActiveState::default(),
@@ -1602,7 +1602,7 @@ mod tests {
         assert_eq!(read(&dir, "u"), format!("{u}NEW = \"@keychain\"\n"));
         assert_eq!(read(&dir, "a"), SECRET_A);
         assert_eq!(read(&dir, "b"), SECRET_B);
-        let out = activate(
+        let out = activate_here(
             &ctx(&cfg, &store, &ScriptedPrompter::new()),
             "u",
             &ActiveState::default(),

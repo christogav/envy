@@ -3,7 +3,7 @@
 <p align="center">
   <b>Your secrets in the Keychain. Your shell, one command away from any persona.</b><br>
   Load a named set of credentials and variables into your <i>current</i> zsh shell,<br>
-  and flip to another set without leaving a trace of the first.
+  stack another on top, and take either off without leaving a trace.
 </p>
 
 <p align="center">
@@ -16,7 +16,8 @@
 
 ```console
 $ envy work         # GITHUB_TOKEN, AWS_PROFILE, ... are now set in this shell
-$ envy personal     # work's variables are gone, personal's are set
+$ envy personal     # personal's variables are added to work's
+$ envy --off work   # work's are gone, personal's stay
 $ envy --off        # nothing from envy is left in your environment
 ```
 
@@ -47,7 +48,8 @@ you want your whole interactive shell to *be* "work" for the afternoon.
 
 envy keeps your variables in named sets called **namespaces**. Secrets are stored
 in the macOS Keychain, never in a file. You load a namespace into the shell
-you are already in, and loading another one **cleanly replaces** the first.
+you are already in. Loading another one **adds** it, and removing one takes out
+exactly what it set.
 
 ```console
 $ envy work --new
@@ -65,15 +67,16 @@ AWS_PROFILE            "prod"
 $ envy work                  # load it
 $ echo $AWS_REGION
 eu-west-1
-$ envy personal              # switch: everything work set is removed first
-$ envy --off                 # unload
+$ envy personal              # add personal's variables on top of work's
+$ envy --off work            # remove work's; personal's stay
+$ envy --off                 # unload everything
 ```
 
 |  | Dotfiles / `.env` | envchain | **envy** |
 |---|---|---|---|
 | Secrets at rest | plain text | Keychain | **Keychain** |
-| Scope | every shell, always | one command | **the current shell, until you switch** |
-| Switching personas | edit and `source` by hand | pick per command | **`envy other`: the old set is removed** |
+| Scope | every shell, always | one command | **the current shell, until you remove it** |
+| Switching personas | edit and `source` by hand | pick per command | **`envy --off work`, then `envy other`; or link them and `envy other` swaps** |
 | Non-secret values (region, org) | in the file | no, everything is a secret | **yes, in a readable TOML file** |
 | Keeping accounts consistent | by hand | by hand | **linked namespaces** |
 
@@ -96,7 +99,7 @@ that `eval`s them.
                 │                └───────────────┬───────────────┘
                 │                                │
                 └──── export A='…'  export B='…' ┘
-                      (unset the previous namespace's names first)
+                      (`--off` unsets a namespace's names)
 ```
 
 Plain values and variable names live in `~/.config/envy/<namespace>.toml`.
@@ -148,10 +151,11 @@ any name (even `off` or `new`).
 
 | Command | What it does |
 |---|---|
-| `envy`, `envy --list` (`--ls`) | List namespaces and show which one is active (names only). Inside a project, each level is listed: the project's first, then yours, with names a nearer level hides marked `(shadowed)`. |
+| `envy`, `envy --list` (`--ls`) | List namespaces and mark every active one with `*` (names only). With more than one active, a last line `active (oldest first): a, b` gives the order. Inside a project, each level is listed: the project's first, then yours, with names a nearer level hides marked `(shadowed)`. |
 | `envy <ns> --list` (`--ls`) | Show the variables in `<ns>`: a `source:` line (`project (<file>)` or `user`), its link group, and each variable's value: plain values quoted (control characters escaped), secrets as `@keychain`, never their value. Nothing is read from the Keychain. |
-| `envy <ns>` | Load `<ns>`, first removing what the previous namespace set. |
-| `envy --off` | Remove what the active namespace set. |
+| `envy <ns>` | Add `<ns>` to what is already loaded (see [Stacking](#stacking)). A namespace linked to an active one replaces it; one that is already active is reloaded and moved to the top. |
+| `envy --off` | Remove every active namespace: unset all the variables envy set. |
+| `envy --off <ns>`, `envy <ns> --off` | Remove just `<ns>`. A variable it was winning gets its value back from the next namespace that sets it. An error if `<ns>` is not active. |
 | `envy <ns> --new` | Create an empty namespace: in the nearest project `.envy/` folder if there is one, otherwise your own. |
 | `envy <ns> --new --project` | Create the namespace in a project `.envy/` folder, making the folder if needed: at the git repository root inside a repository, otherwise in the current directory. Refused in your home directory or above it. |
 | `envy <ns> --user`, `envy <ns> ... --user` | Use your own `<ns>` even when the project has one with the same name. Works with every command that takes a namespace. |
@@ -176,6 +180,60 @@ changes nothing.
 
 An unknown namespace is an error, never an automatic create, so a typo can't
 make a new namespace.
+
+## Stacking
+
+Several namespaces can be active at once, each added with `envy <ns>`. Say you
+keep a standing `common` namespace and a `web` one for the project you are in:
+
+```console
+$ envy common
+$ envy web                  # both are active; web was added last
+$ envy --off common         # only web's variables are left
+$ envy --off                # nothing is left
+```
+
+- **Later wins.** If a namespace you add sets a variable that an active one
+  already sets, the one activated last wins, and envy warns on stderr, naming
+  the variable (never its value) and both namespaces:
+
+  ```console
+  $ envy web
+  warning: AWS_REGION is set by both "common" and "web"; "web" wins (it was activated last)
+  ```
+
+- **Removing one.** `envy --off <ns>` unsets the variables only `<ns>` set. A
+  variable it was winning is set again to the value from the next namespace
+  that defines it (the Keychain is read again for that, as when loading); a
+  variable another namespace was winning is left as it was.
+- **Linked namespaces replace each other.** Namespaces in one [link
+  group](#linked-namespaces) define the same variables, so they are
+  alternatives: `envy personal-aws` while `work-aws` is loaded swaps one for the
+  other, as before. Anything not linked to an active namespace is added.
+- **A name appears once.** Loading a namespace that is already active (also the
+  same name from the other level, as with `--user`) replaces that entry and
+  moves it to the top.
+- **Status.** `envy` marks every active namespace with `*`, and when more than
+  one is active adds a line giving the order, so the winner of a collision can
+  be read off:
+
+  ```console
+  $ envy
+  * common
+  * web
+  active (oldest first): common, web
+  ```
+
+**Restoring.** To give a variable the removed namespace was winning its value back, `--off <ns>` reads
+the remaining namespaces again; envy never keeps secret values in your shell's
+state. So a restore never prompts, and never exports from a project file that
+is not trusted (changed since you confirmed it, or never confirmed for this
+checkout): those variables stay unset, and envy says which on stderr. A
+namespace loaded from a project folder you have since left cannot be read
+again either: the variables it was winning stay unset, and the message says to
+run `envy <name>` in that project to load it again (or `envy --off <name>`
+there to remove it), where `<name>` is the namespace that was loaded from it. Plain `envy --off` always unsets
+everything.
 
 ## Namespace files
 
@@ -355,12 +413,17 @@ Project secrets are Keychain items with service `envy.project/<identity>/<ns>`
 (for example `envy.project/acme/api/dev`), account = the variable name. Every
 envy item still starts with `envy.`.
 
-**Which one is loaded.** Besides `ENVY_ACTIVE` (the name) and `ENVY_VARS` (the
-variables it set), envy records `ENVY_SOURCE` in your shell: `user`, or the
-project's `.envy` folder. `envy --list` uses it to star the level you loaded
-(even when it is shadowed, after `--user`), or says `(from another folder)` when
-you loaded it in another project. It is only compared, never run or used as a
-path, and a namespace file can't set any of the three.
+**Which ones are loaded.** envy records its state in your shell:
+`ENVY_ACTIVE` lists the active namespaces, space separated, oldest first (handy
+in a prompt), `ENVY_VARS` is the flat list of variable names they set, and
+`ENVY_STACK` holds the per-namespace data: each one's name, level (`user`, or
+the project's `.envy` folder) and variables, never a value. `envy --list` uses
+the level to star the one you loaded (even when it is shadowed, after
+`--user`), or says `(from another folder)` when you loaded it in another
+project. Levels are only compared, never run or used as a path, and a
+namespace file can't set any of these. An older envy's `ENVY_SOURCE` is no
+longer set; a value left in a running shell is read as before and cleared the
+next time you load or remove a namespace.
 
 **Removing.** `envy dev --rm` on a project namespace deletes the file from the
 working tree (git status shows it). Its Keychain items are shared with every
@@ -430,8 +493,8 @@ question; envy then tells you which ones it kept.
 
 ## Known limitations
 
-- macOS and zsh only. No bash or fish, no syncing between machines, no
-  stacking of several namespaces at once.
+- macOS and zsh only. No bash or fish, no syncing between machines. One
+  `envy` command loads one namespace; there is no `envy a b`.
 - The list of refused variable names is not complete yet. `KEYTIMEOUT`,
   `LISTMAX`, `MAILCHECK`, `signals`, `ERRNO` and `ZLE_RPROMPT_INDENT` are
   still accepted, and using one as a variable name makes zsh misread its value

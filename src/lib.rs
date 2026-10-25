@@ -12,5 +12,6 @@ pub mod project;
 pub mod prompt;
 pub mod quote;
 pub mod secret;
+pub mod stack;
 pub mod store;
 pub mod trust;

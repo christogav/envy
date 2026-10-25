@@ -12,7 +12,10 @@ use crate::names::{validate_namespace, validate_var};
 pub enum Action {
     Status,
     Activate(String),
+    /// `--off`: remove every active namespace.
     Off,
+    /// `--off <name>`: remove one active namespace.
+    OffNamed(String),
     Init(String),
     New {
         ns: String,
@@ -54,12 +57,17 @@ pub struct Command {
 /// Shown after the options in `--help`: what envy does, and the setup line.
 const AFTER_HELP: &str = "\
 envy keeps sets of environment variables, called namespaces, and loads one
-into the current shell with `envy <namespace>`, replacing the namespace loaded
-before (`envy --off` unloads it). Secrets live in the macOS Keychain; plain
-values and the names live in ~/.config/envy/<namespace>.toml (or in
-$ENVY_CONFIG_DIR). Run `envy --list` (or `envy` alone) to list the namespaces,
-and `envy <namespace> --list` (alias `--ls`) to show a namespace's variables:
-plain values are shown, secret values never are.
+into the current shell with `envy <namespace>`. Namespaces stack: each one you
+load is added to those already loaded, and if two set the same variable the one
+loaded last wins, with a warning. A namespace linked to a loaded one replaces
+it instead, and loading a name again moves it to the top. `envy --off <name>`
+removes one namespace (a variable it was winning gets its value back from the
+next namespace that sets it); `envy --off` removes them all. Secrets live in
+the macOS Keychain; plain values and the names live in
+~/.config/envy/<namespace>.toml (or in $ENVY_CONFIG_DIR). Run `envy --list`
+(or `envy` alone) to list the namespaces, and `envy <namespace> --list` (alias
+`--ls`) to show a namespace's variables: plain values are shown, secret values
+never are.
 
 A namespace can also live in a project's .envy/ folder. A name resolves to the
 project's namespace first, then your own; `envy <namespace> --user` uses your
@@ -88,7 +96,7 @@ struct Flags {
     /// Namespace to act on (comes first; may be named like a flag, e.g. `off`)
     namespace: Option<String>,
 
-    /// Deactivate the active namespace
+    /// Remove every active namespace; `--off NAME` (or `NAME --off`) removes only that one
     #[arg(long)]
     off: bool,
 
@@ -165,8 +173,10 @@ fn parse_unredacted(args: Vec<OsString>) -> Result<Command> {
     // The shell function evaluates by the shape of the arguments, and a `--`
     // is a flag-like word to it: refuse the one spelling that would activate
     // through it, so the function and the parser never disagree.
-    if matches!(command.action, Action::Activate(_) | Action::Off)
-        && args.iter().skip(1).any(|a| a == "--")
+    if matches!(
+        command.action,
+        Action::Activate(_) | Action::Off | Action::OffNamed(_)
+    ) && args.iter().skip(1).any(|a| a == "--")
     {
         bail!("a bare `--` is not supported when loading a namespace: envy <namespace>");
     }
@@ -371,13 +381,13 @@ impl Flags {
             validate_namespace(value)?;
         }
 
-        // Only `--off`, `--init` and no flags at all work without a namespace,
-        // and the first two must not be given one.
-        if off || init.is_some() {
+        // Only `--off`, `--init` and no flags at all work without a namespace.
+        // `--off` may take one (the namespace to remove), `--init` may not.
+        if init.is_some() {
             if namespace.is_some() {
-                bail!("--off and --init do not take a namespace");
+                bail!("--init does not take a namespace");
             }
-        } else if namespace.is_none() && chosen.iter().any(|&c| c) {
+        } else if !off && namespace.is_none() && chosen.iter().any(|&c| c) {
             // `--secret`/`--plain` take every word after them, so a namespace
             // typed after the flag ends up among the items.
             bail!("this action needs a namespace, and it comes first: envy <namespace> --flag");
@@ -406,7 +416,10 @@ impl Flags {
         let ns = namespace.clone();
         let need = || ns.clone().expect("namespace checked above");
         let action = if off {
-            Action::Off
+            match namespace {
+                Some(ns) => Action::OffNamed(ns),
+                None => Action::Off,
+            }
         } else if let Some(shell) = init {
             if shell != "zsh" {
                 bail!("unsupported shell {shell:?}: only zsh is supported");
@@ -479,6 +492,9 @@ mod tests {
             (&["off"], Action::Activate(s("off"))),
             (&["new"], Action::Activate(s("new"))),
             (&["--off"], Action::Off),
+            (&["--off", "work"], Action::OffNamed(s("work"))),
+            (&["work", "--off"], Action::OffNamed(s("work"))),
+            (&["--off", "off"], Action::OffNamed(s("off"))),
             (&["--init", "zsh"], Action::Init(s("zsh"))),
             (
                 &["work", "--new"],
@@ -939,8 +955,11 @@ mod tests {
     #[test]
     fn rejects_invalid_invocations() {
         let cases: Vec<&[&str]> = vec![
-            &["--off", "work"],
-            &["work", "--off"],
+            &["--off", "a", "b"],
+            &["a", "--off", "b"],
+            &["--off", "work", "--user"],
+            &["--off", "work", "--list"],
+            &["--off", "../x"],
             &["--init"],
             &["--init", "bash"],
             &["--init", "zsh", "work"],
@@ -1128,6 +1147,42 @@ mod tests {
     }
 
     #[test]
+    fn off_with_a_name_rejects_user_with_the_existing_wording() {
+        for args in [
+            &["--off", "work", "--user"][..],
+            &["work", "--off", "--user"],
+            &["--user", "--off", "work"],
+        ] {
+            let msg = p(args).unwrap_err().to_string();
+            assert_eq!(
+                msg,
+                "--user does not apply to --off or --init: it picks which namespace of a name to use",
+                "{args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn init_still_rejects_a_namespace() {
+        for args in [&["--init", "zsh", "work"][..], &["work", "--init", "zsh"]] {
+            let msg = p(args).unwrap_err().to_string();
+            assert_eq!(msg, "--init does not take a namespace", "{args:?}");
+        }
+    }
+
+    #[test]
+    fn off_with_a_name_redacts_text_after_an_equals_sign() {
+        for args in [
+            &["--off", "work", "--off=zq-abc"][..],
+            &["--off=zq-abc", "work"],
+            &["--off", "work", "zq=zq-abc"],
+        ] {
+            let msg = error_text(args);
+            assert!(!msg.contains("zq-abc"), "{args:?}: {msg}");
+        }
+    }
+
+    #[test]
     fn user_without_a_namespace_shows_a_form_that_works() {
         for args in [
             &["--user"][..],
@@ -1241,6 +1296,12 @@ mod tests {
             &["--off=1"],
             &["-"],
             &["--user", "-"],
+            &["--off", "-x"],
+            &["-x", "--off"],
+            &["--off", "a", "b"],
+            &["--off", "dev", "--user"],
+            &["--user", "--off", "dev"],
+            &["--off", "--list"],
         ];
         assert!(table.len() >= 50);
         // A single word that is not a valid name is passed to the binary by
@@ -1264,7 +1325,7 @@ mod tests {
             let parsed = pc(args);
             let evaluated = matches!(
                 parsed.as_ref().map(|c| &c.action),
-                Ok(Action::Activate(_)) | Ok(Action::Off)
+                Ok(Action::Activate(_)) | Ok(Action::Off) | Ok(Action::OffNamed(_))
             );
             assert_eq!(
                 wrapper_evaluates(&owned),

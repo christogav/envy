@@ -2,13 +2,14 @@
 //! and the interactive ones that change namespaces (`create`, `set_vars`,
 //! `edit`, `remove`), with the write ordering they share ([`apply`]).
 
+use std::collections::BTreeMap;
 use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 
-use crate::activate::{ActiveState, render_activate};
+use crate::activate::{read_value, read_values, render_transition};
 use crate::config::{Config, NamespaceFile, SECRET_MARKER, Value};
 use crate::display::quote_for_display;
 use crate::levels::{Entry, Level, Levels, label};
@@ -17,11 +18,31 @@ use crate::names::{validate_namespace, validate_var};
 use crate::project::encode_path;
 use crate::prompt::{Prompter, plain_label, secret_label, vet_plain};
 use crate::secret::Secret;
+use crate::stack::{
+    ActiveState, Change as StackChange, Entry as StackEntry, Export, Warning, transition,
+};
 use crate::store::SecretStore;
 use crate::trust::{Purpose, TrustStore, confirmation_text_for};
 
-/// Shell text that switches to namespace `ns`. The result contains secrets
-/// by design: the caller may only write it to stdout.
+/// What `envy <ns>` produces: shell text for the wrapper's `eval`, which
+/// contains secrets by design and may only be written to stdout, and notes
+/// (collision warnings, variables that could not be restored) for stderr,
+/// which name variables and namespaces only.
+pub struct Activation {
+    pub stdout: String,
+    pub notes: Vec<String>,
+}
+
+/// Shows the notes only: `stdout` holds secret values.
+impl std::fmt::Debug for Activation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Activation")
+            .field("notes", &self.notes)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Adds namespace `ns` (from `ctx.cfg`, one of `levels`) to the stack `prev`.
 ///
 /// In order:
 /// 1. load `ns`, and refuse a linked namespace that drifted from its group;
@@ -29,11 +50,17 @@ use crate::trust::{Purpose, TrustStore, confirmation_text_for};
 ///    trusted, show the confirmation ([`check_trust`]);
 /// 3. ask, at a hidden prompt, for every secret the file lists that is not in
 ///    the Keychain (at either level);
-/// 4. only then write: save the new secrets, record the trust, render.
+/// 4. only then write: save the new secrets, record the trust;
+/// 5. work out the change: `ns` goes on top, replacing any entry with its
+///    name (from either level) and any linked alternative ([`linked_entries`]);
+/// 6. read every value the change exports: this namespace's, and the ones a
+///    replaced entry was shadowing ([`restore_values`], which never prompts);
+/// 7. render.
 ///
 /// A no, a failed prompt or no terminal leaves the Keychain, the trust
-/// records and stdout untouched.
-pub fn activate(ctx: &Ctx, ns: &str, prev: &ActiveState) -> Result<String> {
+/// records and stdout untouched. A failed read in step 6 returns `Err`
+/// before any output is built.
+pub fn activate(ctx: &Ctx, levels: &Levels, ns: &str, prev: &ActiveState) -> Result<Activation> {
     let file = ctx.cfg.load(ns)?;
     link::ensure_aligned(ctx.cfg, &file)?;
     let must_record = check_trust(ctx, &file)?;
@@ -63,11 +90,267 @@ pub fn activate(ctx: &Ctx, ns: &str, prev: &ActiveState) -> Result<String> {
     if must_record && let Err(e) = record_trust(ctx, &file) {
         return Err(rollback(ctx, &key, undo, e));
     }
-    // `render_activate` fetches every secret before building any output, so
-    // a failure here prints nothing. The new secrets and the trust record
-    // both stay: the user entered and confirmed them, and a render failure
-    // does not roll either back.
-    render_activate(&file, &label(ctx.cfg), prev, ctx.store)
+
+    let here = label(ctx.cfg);
+    let entry = StackEntry {
+        namespace: ns.to_string(),
+        source: Some(here.clone()),
+        vars: file.vars().into_iter().map(|(name, _)| name).collect(),
+    };
+    let replaces = linked_entries(ctx.cfg, &here, &file, prev);
+    let t = transition(prev, &StackChange::Add { entry, replaces })?;
+    // Every value is read before any output is built, so a failure here
+    // prints nothing. The new secrets and the trust record both stay: the
+    // user entered and confirmed them, and a read failure does not roll
+    // either back.
+    let mut values = read_values(&file, ctx.store)?;
+    let (restored, unrestored) = restore_values(
+        levels,
+        ctx.store,
+        &t.next,
+        &t.export,
+        Some(ns),
+        Restoring::Activation,
+    )?;
+    values.extend(restored);
+    let mut notes: Vec<String> = t.warnings.iter().map(warning_text).collect();
+    notes.extend(unrestored);
+    Ok(Activation {
+        stdout: render_transition(&t, &values),
+        notes,
+    })
+}
+
+/// Removes namespace `ns` from the stack `prev` (`envy --off <ns>`): unsets
+/// the variables only it defined and restores those it was shadowing from
+/// the next namespace that defines them ([`restore_values`]: re-read, trust
+/// checked, never prompting). `ns` is not active: an `Err` naming it, and
+/// nothing changes. Every value is read before any output is built.
+pub fn deactivate(
+    store: &dyn SecretStore,
+    levels: &Levels,
+    ns: &str,
+    prev: &ActiveState,
+) -> Result<Activation> {
+    deactivate_lazy(store, ns, prev, || Ok(levels))
+}
+
+/// [`deactivate`], but the levels are only asked for (`levels`) when a
+/// variable has to be restored; removing a namespace that shadowed nothing
+/// never needs them.
+pub fn deactivate_lazy<L: std::borrow::Borrow<Levels>>(
+    store: &dyn SecretStore,
+    ns: &str,
+    prev: &ActiveState,
+    levels: impl FnOnce() -> Result<L>,
+) -> Result<Activation> {
+    let t = transition(
+        prev,
+        &StackChange::Remove {
+            namespace: ns.to_string(),
+        },
+    )?;
+    let (values, notes) = if t.export.is_empty() {
+        Default::default()
+    } else {
+        let levels = levels()?;
+        restore_values(
+            levels.borrow(),
+            store,
+            &t.next,
+            &t.export,
+            None,
+            Restoring::Removal,
+        )?
+    };
+    Ok(Activation {
+        stdout: render_transition(&t, &values),
+        notes,
+    })
+}
+
+/// The entries of `prev` that `file` replaces as linked alternatives: those
+/// recorded from this level (`here`, its label) whose file here is in the same
+/// link group. Entries from other levels are never re-read, so never linked;
+/// an entry whose file cannot be loaded is not linked either. The entry with
+/// `file`'s own name is replaced anyway ([`transition`]).
+fn linked_entries(
+    cfg: &Config,
+    here: &str,
+    file: &NamespaceFile,
+    prev: &ActiveState,
+) -> Vec<String> {
+    let Some(group) = file.link() else {
+        return Vec::new();
+    };
+    let mut linked: Vec<String> = Vec::new();
+    for e in &prev.entries {
+        if e.namespace == file.name()
+            || e.source.as_deref() != Some(here)
+            || linked.contains(&e.namespace)
+        {
+            continue;
+        }
+        if cfg
+            .load(&e.namespace)
+            .is_ok_and(|f| f.link() == Some(group))
+        {
+            linked.push(e.namespace.clone());
+        }
+    }
+    linked
+}
+
+/// The stderr line for a warning. Names only, never a value.
+fn warning_text(warning: &Warning) -> String {
+    match warning {
+        Warning::Collision {
+            var,
+            winner,
+            shadowed,
+        } => format!(
+            "warning: {var} is set by both {shadowed:?} and {winner:?}; {winner:?} wins (it was activated last)"
+        ),
+    }
+}
+
+/// Why variables are being restored: it only changes the wording of the notes
+/// that tell the user how to get an unrestored variable back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Restoring {
+    /// Activating a namespace replaced an entry that shadowed them.
+    Activation,
+    /// `envy --off <name>` removed the entry that shadowed them.
+    Removal,
+}
+
+/// The values of `exports` (each owned, in `state`, by the namespace it
+/// names), except those of namespace `skip`, whose values the caller reads
+/// itself. Each owner is re-read from the level its entry records, found
+/// through [`Levels::config_for`]; nothing ever prompts. A variable is left
+/// out (and so left unset) with a note when its owner's level is unknown or
+/// not visible from here, its project file is not trusted as it is now
+/// ([`TrustStore::is_trusted`]: it is then not read at all), its file cannot
+/// be loaded or no longer defines it, or its secret is not in the store.
+/// A failed store read is an error.
+///
+/// Returns the values and the notes for stderr: one line per reason, naming
+/// the variables, the namespace and, for a level not visible from here, its
+/// folder. Never a value.
+pub fn restore_values(
+    levels: &Levels,
+    store: &dyn SecretStore,
+    state: &ActiveState,
+    exports: &[Export],
+    skip: Option<&str>,
+    why: Restoring,
+) -> Result<(BTreeMap<String, String>, Vec<String>)> {
+    let mut values = BTreeMap::new();
+    // Per reason, the variables it leaves unset, in order.
+    let mut unset: Vec<(String, Vec<String>)> = Vec::new();
+    for export in exports {
+        if skip == Some(export.from.as_str()) {
+            continue;
+        }
+        match restore_one(levels, store, state, export, why)? {
+            Ok(text) => {
+                values.insert(export.var.clone(), text);
+            }
+            Err(reason) => match unset.iter_mut().find(|(r, _)| *r == reason) {
+                Some((_, vars)) => vars.push(export.var.clone()),
+                None => unset.push((reason, vec![export.var.clone()])),
+            },
+        }
+    }
+    let notes = unset
+        .into_iter()
+        .map(|(reason, vars)| format!("note: left unset: {} ({reason})", vars.join(", ")))
+        .collect();
+    Ok((values, notes))
+}
+
+/// The value of one export ([`restore_values`]): `Ok(Ok(value))`, or
+/// `Ok(Err(reason))` when it cannot be restored.
+fn restore_one(
+    levels: &Levels,
+    store: &dyn SecretStore,
+    state: &ActiveState,
+    export: &Export,
+    why: Restoring,
+) -> Result<std::result::Result<String, String>> {
+    let ns = export.from.as_str();
+    let var = export.var.as_str();
+    // The exact entry that wins the variable: a tampered state may hold the
+    // name more than once. Callers pass the state the exports were computed
+    // from, so its winner is always the export's owner.
+    let owner = state.winner(var).filter(|e| e.namespace == ns);
+    debug_assert!(owner.is_some(), "export of {var} does not match the state");
+    let Some(owner) = owner else {
+        return Ok(Err(format!(
+            "internal error: {var} is not owned by namespace {ns:?} in the active state"
+        )));
+    };
+    let Some(source) = owner.source.as_deref() else {
+        let how = match why {
+            Restoring::Activation => format!("run envy {ns} to load it again"),
+            Restoring::Removal => "run envy --off to remove everything".to_string(),
+        };
+        return Ok(Err(format!(
+            "namespace {ns:?} was loaded by an older envy, so its level is unknown; {how}"
+        )));
+    };
+    let Some(cfg) = levels.config_for(source) else {
+        let how = match why {
+            Restoring::Activation => format!("run envy {ns} in that project to load it again"),
+            Restoring::Removal => format!(
+                "run envy {ns} in that project to load it again, or envy --off {ns} there to remove it"
+            ),
+        };
+        return Ok(Err(format!(
+            "namespace {ns:?} was loaded from {source}, which is not visible from this folder; {how}"
+        )));
+    };
+    let Ok(file) = cfg.load(ns) else {
+        return Ok(Err(format!(
+            "namespace {ns:?} cannot be read; run envy {ns} to see why"
+        )));
+    };
+    if let Some(root) = cfg.root() {
+        let trust = TrustStore::new(cfg.user_dir());
+        if !trust.is_trusted(root, ns, &file.text())? {
+            let why = if trust.previously_trusted(root, ns)? {
+                "has changed since you confirmed it"
+            } else {
+                "is not confirmed"
+            };
+            return Ok(Err(format!(
+                "project namespace {ns:?} in {source} {why}; run envy {ns} there to review it"
+            )));
+        }
+    }
+    let Some(value) = file.get(var) else {
+        return Ok(Err(format!("namespace {ns:?} no longer defines them")));
+    };
+    Ok(read_value(&file, var, &value, store)
+        .with_context(|| format!("cannot restore {var} from namespace {ns}"))?
+        .ok_or_else(|| {
+            format!(
+                "not in the Keychain for namespace {ns:?}; run envy {ns} to enter missing secrets"
+            )
+        }))
+}
+
+/// [`activate`] at `ctx.cfg` alone (plus the user level), for the tests
+/// written before stacking: the stdout text.
+#[cfg(test)]
+pub(crate) fn activate_here(ctx: &Ctx, ns: &str, prev: &ActiveState) -> Result<String> {
+    let user = Config::new(ctx.cfg.user_dir().to_path_buf());
+    let levels = if ctx.cfg.is_project() {
+        Levels::with_projects(vec![ctx.cfg.clone()], user)
+    } else {
+        Levels::user_only(ctx.cfg.clone())
+    };
+    activate(ctx, &levels, ns, prev).map(|a| a.stdout)
 }
 
 /// How prompts name a namespace: with its project at project level, so the
@@ -196,9 +479,10 @@ pub(crate) fn record_trust(ctx: &Ctx, file: &NamespaceFile) -> Result<()> {
 /// levels, each level gets a block, nearest project first and the user level
 /// last, introduced by `project: <its .envy folder>` (percent-encoded, as the
 /// path is the repository's to choose) or `user:`. A name that a nearer level
-/// already provides is marked ` (shadowed)`. The `*` marks the row that was
-/// loaded ([`is_active`]); when no row is that one, a last line says the
-/// active namespace no longer exists or was loaded from another folder.
+/// already provides is marked ` (shadowed)`. The `*` marks every row that was
+/// loaded ([`is_active`]); each active entry no row matches gets a line saying
+/// it no longer exists or was loaded from another folder. With more than one
+/// active, a last line gives the order, oldest first.
 pub fn status(levels: &Levels, active: &ActiveState) -> Result<String> {
     let entries = levels.entries()?;
     let level_label = |level: &Level| match level {
@@ -242,13 +526,22 @@ pub fn status(levels: &Levels, active: &ActiveState) -> Result<String> {
         out.push_str("user:\n");
         out.push_str(&block(&Level::User));
     }
-    if let Some(ns) = active.namespace.as_deref()
-        && !entries.iter().any(|e| e.name == ns && starred(e))
-    {
+    for current in &active.entries {
+        let ns = current.namespace.as_str();
+        let listed = entries.iter().any(|e| {
+            e.name == ns
+                && entry_matches(current, &e.name, &level_label(&e.level), e.shadowed, || {
+                    Ok(count(&e.name))
+                })
+                .unwrap_or(false)
+        });
+        if listed {
+            continue;
+        }
         // An old shell (no source) with an ambiguous name marks nothing and
         // adds nothing: the name does exist.
-        let ambiguous = active.source.is_none() && count(ns) > 1;
-        let elsewhere = match active.source.as_deref() {
+        let ambiguous = current.source.is_none() && count(ns) > 1;
+        let elsewhere = match current.source.as_deref() {
             None | Some("user") => false,
             Some(src) => !levels.projects().iter().any(|p| label(p) == src),
         };
@@ -258,28 +551,54 @@ pub fn status(levels: &Levels, active: &ActiveState) -> Result<String> {
             out.push_str(&format!("* {ns} (no longer exists)\n"));
         }
     }
+    if active.entries.len() > 1 {
+        let names: Vec<&str> = active
+            .entries
+            .iter()
+            .map(|e| e.namespace.as_str())
+            .collect();
+        out.push_str(&format!("active (oldest first): {}\n", names.join(", ")));
+    }
     if out.is_empty() {
         out.push_str("no namespaces yet; create one with: envy <name> --new\n");
     }
     Ok(out)
 }
 
-/// Whether namespace `name` at the level labelled `level` is the one the
-/// shell loaded. With `ENVY_SOURCE`, the name and the level must both match.
-/// A shell from before it existed records no level: then the unshadowed row
-/// of the name counts, but only if just one level has the name (`count`),
-/// since which one was loaded is unknown.
+/// Whether namespace `name` at the level labelled `level` is one the shell
+/// loaded: any active entry matches ([`entry_matches`]).
 fn is_active(
     active: &ActiveState,
     name: &str,
     level: &str,
     shadowed: bool,
+    count: impl Fn() -> Result<usize>,
+) -> Result<bool> {
+    for current in &active.entries {
+        if entry_matches(current, name, level, shadowed, &count)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Whether the active entry `current` is namespace `name` at the level
+/// labelled `level`. With a recorded source, the name and the level must both
+/// match (the label is compared, never used as a path). An entry from before
+/// sources were recorded has no level: then the unshadowed row of the name
+/// counts, but only if just one level has the name (`count`), since which one
+/// was loaded is unknown.
+fn entry_matches(
+    current: &crate::stack::Entry,
+    name: &str,
+    level: &str,
+    shadowed: bool,
     count: impl FnOnce() -> Result<usize>,
 ) -> Result<bool> {
-    if active.namespace.as_deref() != Some(name) {
+    if current.namespace != name {
         return Ok(false);
     }
-    Ok(match active.source.as_deref() {
+    Ok(match current.source.as_deref() {
         Some(source) => source == level,
         None => !shadowed && count()? <= 1,
     })
@@ -293,7 +612,7 @@ fn is_active(
 /// never be fetched, let alone printed. Plain values are quoted and escaped
 /// ([`quote_for_display`]) so they cannot disturb the terminal or the layout;
 /// a project file's path is percent-encoded for the same reason. `(active)`
-/// only when this level's `ns` is the one loaded ([`is_active`]).
+/// only when this level's `ns` is one of those loaded ([`is_active`]).
 pub fn list_vars(
     levels: &Levels,
     ns: &str,
@@ -1042,11 +1361,7 @@ mod tests {
     /// `ns` active, loaded from the level labelled `source` (`None`: a
     /// shell from before `ENVY_SOURCE` existed).
     fn act(ns: &str, source: Option<&str>) -> ActiveState {
-        ActiveState {
-            namespace: Some(ns.into()),
-            vars: vec!["A".into()],
-            source: source.map(str::to_string),
-        }
+        ActiveState::single(ns, source, &["A"])
     }
 
     /// The nested listing with `marks` (one char per row, in order: inner
@@ -1289,11 +1604,7 @@ mod tests {
             ),
             ("personal", "[vars]\nC = \"other-value-456\"\n"),
         ]);
-        let active = ActiveState {
-            namespace: Some("work".into()),
-            vars: vec!["A".into(), "B".into()],
-            source: Some("user".into()),
-        };
+        let active = ActiveState::single("work", Some("user"), &["A", "B"]);
         let out = status(&user_levels(&cfg), &active).unwrap();
         assert_eq!(out, "  personal\n* work\n");
         assert!(!out.contains("value"));
@@ -1344,11 +1655,7 @@ mod tests {
             ("dev", "link = \"aws\"\n[vars]\nA = \"1\"\n"),
             ("prod", "[vars]\nA = \"2\"\n"),
         ]);
-        let active = ActiveState {
-            namespace: Some("dev".into()),
-            vars: vec!["A".into()],
-            source: Some("user".into()),
-        };
+        let active = ActiveState::single("dev", Some("user"), &["A"]);
         assert_eq!(
             list_vars(&user_levels(&cfg), "dev", false, &active).unwrap(),
             "namespace: dev (active)\nsource: user\nlink: aws\n\nA  \"1\"\n"
@@ -1491,14 +1798,120 @@ mod tests {
     #[test]
     fn status_flags_active_namespace_that_no_longer_exists() {
         let (_dir, cfg) = config_with(&[("work", "")]);
-        let active = ActiveState {
-            namespace: Some("gone".into()),
-            vars: vec![],
-            source: Some("user".into()),
-        };
+        let active = ActiveState::single("gone", Some("user"), &[]);
         assert_eq!(
             status(&user_levels(&cfg), &active).unwrap(),
             "  work\n* gone (no longer exists)\n"
+        );
+    }
+
+    /// An `ActiveState` of entries, oldest first: `(namespace, source)`.
+    fn stacked(entries: &[(&str, Option<&str>)]) -> ActiveState {
+        ActiveState {
+            entries: entries
+                .iter()
+                .map(|(ns, src)| crate::stack::Entry {
+                    namespace: (*ns).to_string(),
+                    source: src.map(str::to_string),
+                    vars: vec!["A".to_string()],
+                })
+                .collect(),
+            extra_vars: vec![],
+        }
+    }
+
+    #[test]
+    fn status_marks_every_active_namespace() {
+        let (_tmp, home, levels) = nested_levels();
+        let outer = encode_path(&home.join("a/.envy"));
+        let active = stacked(&[("mine", Some("user")), ("ci", Some(&outer))]);
+        let out = status(&levels, &active).unwrap();
+        assert_eq!(
+            out,
+            format!(
+                "{}active (oldest first): mine, ci\n",
+                nested_body(&home, "  *  *")
+            )
+        );
+        // A legacy entry marks only an unambiguous name, alongside others.
+        let active = stacked(&[("web", None), ("dev", None), ("mine", Some("user"))]);
+        let out = status(&levels, &active).unwrap();
+        assert_eq!(
+            out,
+            format!(
+                "{}active (oldest first): web, dev, mine\n",
+                nested_body(&home, " *   *")
+            )
+        );
+    }
+
+    #[test]
+    fn status_lists_the_order_when_more_than_one() {
+        let (_dir, cfg) = config_with(&[("a", ""), ("b", ""), ("c", "")]);
+        let active = stacked(&[
+            ("c", Some("user")),
+            ("a", Some("user")),
+            ("b", Some("user")),
+        ]);
+        assert_eq!(
+            status(&user_levels(&cfg), &active).unwrap(),
+            "* a\n* b\n* c\nactive (oldest first): c, a, b\n"
+        );
+    }
+
+    #[test]
+    fn status_with_one_active_has_no_order_line() {
+        let (_dir, cfg) = config_with(&[("a", ""), ("b", "")]);
+        let out = status(&user_levels(&cfg), &act("a", Some("user"))).unwrap();
+        assert_eq!(out, "* a\n  b\n");
+        assert!(!out.contains("oldest first"), "{out}");
+    }
+
+    #[test]
+    fn status_reports_each_missing_or_foreign_entry() {
+        let (_dir, cfg) = config_with(&[("a", "")]);
+        let active = stacked(&[
+            ("gone", Some("user")),
+            ("a", Some("user")),
+            ("far", Some("/elsewhere/.envy")),
+        ]);
+        assert_eq!(
+            status(&user_levels(&cfg), &active).unwrap(),
+            "* a\n* gone (no longer exists)\n* far (from another folder)\n\
+             active (oldest first): gone, a, far\n"
+        );
+    }
+
+    #[test]
+    fn status_with_duplicate_entries_marks_a_row_once_and_does_not_panic() {
+        let (_dir, cfg) = config_with(&[("a", "")]);
+        let active = stacked(&[("a", Some("user")), ("a", Some("user"))]);
+        assert_eq!(
+            status(&user_levels(&cfg), &active).unwrap(),
+            "* a\nactive (oldest first): a, a\n"
+        );
+    }
+
+    #[test]
+    fn list_marks_active_for_any_matching_entry() {
+        let (_dir, cfg) = config_with(&[("dev", "[vars]\nA = \"1\"\n"), ("prod", "")]);
+        let levels = user_levels(&cfg);
+        let active = stacked(&[("dev", Some("user")), ("prod", Some("user"))]);
+        assert_eq!(
+            list_vars(&levels, "dev", false, &active).unwrap(),
+            "namespace: dev (active)\nsource: user\n\nA  \"1\"\n"
+        );
+        assert!(
+            list_vars(&levels, "prod", false, &active)
+                .unwrap()
+                .starts_with("namespace: prod (active)\n")
+        );
+        // Not active at this level: no mark.
+        let other = stacked(&[("dev", Some("/elsewhere/.envy")), ("x", Some("user"))]);
+        assert!(
+            list_vars(&levels, "dev", false, &other)
+                .unwrap()
+                .starts_with("namespace: dev\n")
         );
     }
 
@@ -1508,7 +1921,7 @@ mod tests {
         let store = MemoryStore::default();
         store.set("work", "B", &Secret::new("s".into())).unwrap();
         let prompt = ScriptedPrompter::new();
-        let out = activate(
+        let out = activate_here(
             &ctx_for(&cfg, &store, &prompt),
             "work",
             &ActiveState::default(),
@@ -1516,7 +1929,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             out,
-            "export ENVY_ACTIVE='work'\nexport ENVY_SOURCE='user'\nexport ENVY_VARS='A B'\nexport A='x'\nexport B='s'\n"
+            "export ENVY_ACTIVE='work'\nexport ENVY_STACK='work\u{1f}user\u{1f}A B'\nexport ENVY_VARS='A B'\nunset ENVY_SOURCE\nexport A='x'\nexport B='s'\n"
         );
     }
 
@@ -1525,7 +1938,7 @@ mod tests {
         let (_dir, cfg) = config_with(&[]);
         let store = MemoryStore::default();
         let prompt = ScriptedPrompter::new();
-        let err = activate(
+        let err = activate_here(
             &ctx_for(&cfg, &store, &prompt),
             "nope",
             &ActiveState::default(),
@@ -3418,7 +3831,7 @@ mod tests {
             } else {
                 ScriptedPrompter::new()
             };
-            let out = activate(
+            let out = activate_here(
                 &ctx_for(cfg, &store, &answers),
                 "dev",
                 &ActiveState::default(),
@@ -3608,7 +4021,7 @@ mod tests {
             .with_confirm(true)
             .with_secret("tok-1")
             .with_secret("key-1");
-        let out = activate(
+        let out = activate_here(
             &ctx_for(&cfg, &store, &prompt),
             "dev",
             &ActiveState::default(),
@@ -3617,7 +4030,7 @@ mod tests {
         assert_eq!(
             out,
             format!(
-                "export ENVY_ACTIVE='dev'\nexport ENVY_SOURCE='{}'\nexport ENVY_VARS='REGION TOKEN API_KEY'\n\
+                "export ENVY_ACTIVE='dev'\nexport ENVY_STACK='dev\u{1f}{}\u{1f}REGION TOKEN API_KEY'\nexport ENVY_VARS='REGION TOKEN API_KEY'\nunset ENVY_SOURCE\n\
                  export REGION='eu'\nexport TOKEN='tok-1'\nexport API_KEY='key-1'\n",
                 encode_path(cfg.dir())
             )
@@ -3643,7 +4056,7 @@ mod tests {
         );
         // Trusted and complete: the second load asks nothing.
         let quiet = ScriptedPrompter::new();
-        let again = activate(
+        let again = activate_here(
             &ctx_for(&cfg, &store, &quiet),
             "dev",
             &ActiveState::default(),
@@ -3662,7 +4075,7 @@ mod tests {
             .with_confirm(true)
             .with_secret("tok-1")
             .with_secret("key-1");
-        activate(
+        activate_here(
             &ctx_for(&cfg, &store, &prompt),
             "dev",
             &ActiveState::default(),
@@ -3699,7 +4112,7 @@ mod tests {
             .with_confirm(false)
             .with_secret("tok-1")
             .with_secret("key-1");
-        let err = activate(
+        let err = activate_here(
             &ctx_for(&cfg, &store, &prompt),
             "dev",
             &ActiveState::default(),
@@ -3722,7 +4135,7 @@ mod tests {
             .with_secret("tok-1")
             .with_secret("key-1");
         assert!(
-            activate(
+            activate_here(
                 &ctx_for(&cfg, &store, &prompt),
                 "dev",
                 &ActiveState::default()
@@ -3743,7 +4156,7 @@ mod tests {
         let prompt = ScriptedPrompter::new()
             .with_confirm(true)
             .with_secret("tok-1");
-        let err = activate(
+        let err = activate_here(
             &ctx_for(&cfg, &store, &prompt),
             "dev",
             &ActiveState::default(),
@@ -3772,7 +4185,7 @@ mod tests {
             .with_secret("tok-1")
             .with_secret("key-1");
         assert!(
-            activate(
+            activate_here(
                 &ctx_for(&cfg, &store, &prompt),
                 "dev",
                 &ActiveState::default()
@@ -3797,7 +4210,7 @@ mod tests {
         let prompt = ScriptedPrompter::new()
             .with_confirm(true)
             .with_secret("key-1");
-        let err = activate(
+        let err = activate_here(
             &ctx_for(&cfg, &store, &prompt),
             "dev",
             &ActiveState::default(),
@@ -3819,7 +4232,7 @@ mod tests {
         let store = MemoryStore::default();
         let prompt = ScriptedPrompter::new().with_confirm(false);
         assert!(
-            activate(
+            activate_here(
                 &ctx_for(&cfg, &store, &prompt),
                 "dev",
                 &ActiveState::default()
@@ -3847,7 +4260,7 @@ mod tests {
             .set(PKEY, "TOKEN", &Secret::new("tok-0".into()))
             .unwrap();
         let prompt = ScriptedPrompter::new().with_secret("key-1");
-        let out = activate(
+        let out = activate_here(
             &ctx_for(&cfg, &store, &prompt),
             "dev",
             &ActiveState::default(),
@@ -3874,13 +4287,13 @@ mod tests {
             .with_confirm(true)
             .with_secret("tok-1")
             .with_secret("key-1");
-        activate(&ctx_for(&a, &store, &first), "dev", &ActiveState::default()).unwrap();
+        activate_here(&ctx_for(&a, &store, &first), "dev", &ActiveState::default()).unwrap();
         assert!(trusted(&a, PROJ) && !trusted(&b, PROJ));
         // Same text, same identity, other checkout: asked again; a no leaves
         // checkout b untrusted and the shared secrets alone.
         let declined = ScriptedPrompter::new().with_confirm(false);
         assert!(
-            activate(
+            activate_here(
                 &ctx_for(&b, &store, &declined),
                 "dev",
                 &ActiveState::default()
@@ -3902,9 +4315,10 @@ mod tests {
             .with_confirm(true)
             .with_secret("tok-1")
             .with_secret("key-1");
-        let out_a = activate(&ctx_for(&a, &store, &first), "dev", &ActiveState::default()).unwrap();
+        let out_a =
+            activate_here(&ctx_for(&a, &store, &first), "dev", &ActiveState::default()).unwrap();
         let second = ScriptedPrompter::new().with_confirm(true);
-        let out_b = activate(
+        let out_b = activate_here(
             &ctx_for(&b, &store, &second),
             "dev",
             &ActiveState::default(),
@@ -3915,7 +4329,7 @@ mod tests {
             out_a.replace(&encode_path(a.dir()), "<checkout>"),
             out_b.replace(&encode_path(b.dir()), "<checkout>")
         );
-        assert!(out_b.contains(&format!("export ENVY_SOURCE='{}'\n", encode_path(b.dir()))));
+        assert!(out_b.contains(&format!("\u{1f}{}\u{1f}", encode_path(b.dir()))));
         let asked = second.asked();
         assert_eq!(asked.len(), 1, "{asked:?}");
         let Asked::Confirm(text) = &asked[0] else {
@@ -3947,7 +4361,7 @@ mod tests {
         let prompt = ScriptedPrompter::new()
             .with_confirm(true)
             .with_secret("tok-1");
-        let err = activate(
+        let err = activate_here(
             &ctx_for(&cfg, &store, &prompt),
             "dev",
             &ActiveState::default(),
@@ -3969,14 +4383,14 @@ mod tests {
             .unwrap();
         // Declined, then accepted with the secret prompt failing.
         let declined = ScriptedPrompter::new().with_confirm(false);
-        let err1 = activate(
+        let err1 = activate_here(
             &ctx_for(&cfg, &store, &declined),
             "dev",
             &ActiveState::default(),
         )
         .unwrap_err();
         let failed = ScriptedPrompter::new().with_confirm(true);
-        let err2 = activate(
+        let err2 = activate_here(
             &ctx_for(&cfg, &store, &failed),
             "dev",
             &ActiveState::default(),
@@ -4000,7 +4414,7 @@ mod tests {
         let (_dir, cfg) = config_with(&[("work", "[vars]\nA = \"x\"\nB = \"@keychain\"\n")]);
         let store = MemoryStore::default();
         let prompt = ScriptedPrompter::new().with_secret("b-1");
-        let out = activate(
+        let out = activate_here(
             &ctx_for(&cfg, &store, &prompt),
             "work",
             &ActiveState::default(),
@@ -4020,7 +4434,7 @@ mod tests {
         let store = MemoryStore::default();
         store.set("work", "B", &Secret::new("b-0".into())).unwrap();
         let prompt = ScriptedPrompter::new();
-        activate(
+        activate_here(
             &ctx_for(&cfg, &store, &prompt),
             "work",
             &ActiveState::default(),
@@ -4036,7 +4450,7 @@ mod tests {
         let base = tempfile::tempdir().unwrap();
         let cfg = checkout(base.path(), "a", PROJ);
         let store = MemoryStore::default();
-        let err = activate(
+        let err = activate_here(
             &ctx_for(&cfg, &store, &NoTerminal),
             "dev",
             &ActiveState::default(),
@@ -4051,7 +4465,7 @@ mod tests {
         assert!(!trusted(&cfg, PROJ));
         // A missing secret at user level.
         let (_dir, user) = config_with(&[("work", "[vars]\nB = \"@keychain\"\n")]);
-        let err = activate(
+        let err = activate_here(
             &ctx_for(&user, &store, &NoTerminal),
             "work",
             &ActiveState::default(),
@@ -4099,7 +4513,7 @@ mod tests {
         );
         // Loading it needs no confirmation.
         let quiet = ScriptedPrompter::new();
-        activate(
+        activate_here(
             &ctx_of(&cfg, &store, &quiet),
             "dev",
             &ActiveState::default(),
@@ -4680,7 +5094,7 @@ mod tests {
     /// Loading `dev` now needs no question at all.
     fn activates_quietly(cfg: &Config, store: &MemoryStore) {
         let quiet = ScriptedPrompter::new();
-        activate(&ctx_of(cfg, store, &quiet), "dev", &ActiveState::default()).unwrap();
+        activate_here(&ctx_of(cfg, store, &quiet), "dev", &ActiveState::default()).unwrap();
         assert!(quiet.asked().is_empty(), "{:?}", quiet.asked());
     }
 
@@ -4973,10 +5387,10 @@ mod tests {
         assert!(b_now.contains("NEW = \"2\""), "{b_now}");
         // `a` loads with no question; `b` was never confirmed, so it asks.
         let quiet = ScriptedPrompter::new();
-        activate(&ctx_of(&cfg, &store, &quiet), "a", &ActiveState::default()).unwrap();
+        activate_here(&ctx_of(&cfg, &store, &quiet), "a", &ActiveState::default()).unwrap();
         assert!(quiet.asked().is_empty());
         let ask = ScriptedPrompter::new().with_confirm(false);
-        assert!(activate(&ctx_of(&cfg, &store, &ask), "b", &ActiveState::default()).is_err());
+        assert!(activate_here(&ctx_of(&cfg, &store, &ask), "b", &ActiveState::default()).is_err());
         assert!(
             matches!(&ask.asked()[..], [Asked::Confirm(t)] if t.contains("--require /tmp/x.js")),
             "{:?}",
@@ -5138,7 +5552,7 @@ mod tests {
             // An existing file: loading it (activation, --like source) fails.
             std::fs::write(dir.path().join("evil.toml"), &text).unwrap();
             prefix(cfg.load("evil").unwrap_err());
-            prefix(activate(&ctx, "evil", &ActiveState::default()).unwrap_err());
+            prefix(activate_here(&ctx, "evil", &ActiveState::default()).unwrap_err());
             // A link-group member with such a name stops the propagation.
             std::fs::write(
                 dir.path().join("evil.toml"),
@@ -5153,7 +5567,7 @@ mod tests {
         assert!(snap(&store).is_empty());
         // Lowercase is not the reserved prefix.
         set_vars(&ctx, "work", &[pv("envy_x", "1")]).unwrap();
-        let out = activate(&ctx, "work", &ActiveState::default()).unwrap();
+        let out = activate_here(&ctx, "work", &ActiveState::default()).unwrap();
         assert!(out.ends_with("export envy_x='1'\n"), "{out}");
     }
 
@@ -5191,7 +5605,7 @@ mod tests {
             store: &store,
             prompt: &prompt,
         };
-        assert!(activate(&ctx, "dev", &ActiveState::default()).is_err());
+        assert!(activate_here(&ctx, "dev", &ActiveState::default()).is_err());
         let Asked::Confirm(q) = &prompt.asked()[0] else {
             panic!()
         };
@@ -5227,7 +5641,7 @@ mod tests {
             store: &store,
             prompt: &prompt,
         };
-        assert!(activate(&ctx, "dev", &ActiveState::default()).is_err());
+        assert!(activate_here(&ctx, "dev", &ActiveState::default()).is_err());
         assert_eq!(
             prompt.asked(),
             vec![Asked::Secret(secret_label(
@@ -5248,7 +5662,7 @@ mod tests {
         store.set(PKEY, "TOKEN", &Secret::new("t".into())).unwrap();
         let prompt = ScriptedPrompter::new().with_confirm(false);
         assert!(
-            activate(
+            activate_here(
                 &ctx_of(&cfg, &store, &prompt),
                 "dev",
                 &ActiveState::default()
@@ -5260,5 +5674,706 @@ mod tests {
         };
         assert!(q.contains("has changed since you last trusted it"), "{q}");
         assert!(!q.contains("from another checkout"), "{q}");
+    }
+
+    // ---- stacking ----
+
+    use crate::stack::Entry as StackEntry;
+
+    /// A user level and one project level (`proj/.envy`, identity acme/api)
+    /// as seen from inside `proj`.
+    struct StackLevels {
+        _tmp: tempfile::TempDir,
+        user: Config,
+        proj: Config,
+        levels: Levels,
+    }
+
+    fn stack_levels(user_files: &[(&str, &str)], proj_files: &[(&str, &str)]) -> StackLevels {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().canonicalize().unwrap();
+        let user_dir = base.join("user");
+        let root = base.join("proj");
+        for (dir, files) in [
+            (user_dir.clone(), user_files),
+            (root.join(".envy"), proj_files),
+        ] {
+            std::fs::create_dir_all(&dir).unwrap();
+            for (name, text) in files {
+                std::fs::write(dir.join(format!("{name}.toml")), text).unwrap();
+            }
+        }
+        let user = Config::new(user_dir.clone());
+        let proj = Config::project(root.join(".envy"), root, "acme/api".into(), user_dir);
+        let levels = Levels::with_projects(vec![proj.clone()], user.clone());
+        StackLevels {
+            _tmp: tmp,
+            user,
+            proj,
+            levels,
+        }
+    }
+
+    /// Records the project file `ns` as trusted, as it is now.
+    fn trust_now(cfg: &Config, ns: &str) {
+        crate::trust::TrustStore::new(cfg.user_dir())
+            .record(cfg.root().unwrap(), ns, &cfg.load(ns).unwrap().text())
+            .unwrap();
+    }
+
+    /// A stack of `(name, source, vars)`, oldest first.
+    fn stack_of(entries: &[(&str, &str, &[&str])]) -> ActiveState {
+        ActiveState {
+            entries: entries
+                .iter()
+                .map(|(ns, source, vars)| StackEntry {
+                    namespace: ns.to_string(),
+                    source: Some(source.to_string()),
+                    vars: vars.iter().map(|v| v.to_string()).collect(),
+                })
+                .collect(),
+            extra_vars: vec![],
+        }
+    }
+
+    fn store_of(items: &[(&str, &str, &str)]) -> MemoryStore {
+        let store = MemoryStore::default();
+        for (key, name, value) in items {
+            store
+                .set(key, name, &Secret::new(value.to_string()))
+                .unwrap();
+        }
+        store
+    }
+
+    fn activate_in(
+        s: &StackLevels,
+        cfg: &Config,
+        store: &dyn SecretStore,
+        ns: &str,
+        prev: &ActiveState,
+    ) -> Result<Activation> {
+        // Nothing here may prompt: every secret is already in the store.
+        activate(&ctx_for(cfg, store, &NoTerminal), &s.levels, ns, prev)
+    }
+
+    const LINKED_WORK: &str = "link = \"aws\"\n\n[vars]\nREGION = \"eu\"\nTOKEN = \"@keychain\"\n";
+    const LINKED_PERSONAL: &str =
+        "link = \"aws\"\n\n[vars]\nREGION = \"us\"\nTOKEN = \"@keychain\"\n";
+
+    #[test]
+    fn activating_a_second_namespace_keeps_the_first() {
+        let s = stack_levels(
+            &[
+                ("base", "[vars]\nA = \"1\"\n"),
+                ("work", "[vars]\nB = \"@keychain\"\n"),
+            ],
+            &[],
+        );
+        let store = store_of(&[("work", "B", "b-secret")]);
+        let prev = stack_of(&[("base", "user", &["A"])]);
+        let out = activate_in(&s, &s.user, &store, "work", &prev).unwrap();
+        let next = stack_of(&[("base", "user", &["A"]), ("work", "user", &["B"])]);
+        assert_eq!(
+            out.stdout,
+            format!("{}export B='b-secret'\n", next.state_exports())
+        );
+        assert!(out.notes.is_empty(), "{:?}", out.notes);
+    }
+
+    #[test]
+    fn activating_a_linked_namespace_replaces_the_active_one() {
+        let s = stack_levels(
+            &[
+                ("base", "[vars]\nA = \"1\"\n"),
+                ("work", LINKED_WORK),
+                ("personal", LINKED_PERSONAL),
+            ],
+            &[],
+        );
+        let store = store_of(&[("work", "TOKEN", "tw"), ("personal", "TOKEN", "tp")]);
+        let prev = stack_of(&[
+            ("base", "user", &["A"]),
+            ("work", "user", &["REGION", "TOKEN"]),
+        ]);
+        let out = activate_in(&s, &s.user, &store, "personal", &prev).unwrap();
+        let next = stack_of(&[
+            ("base", "user", &["A"]),
+            ("personal", "user", &["REGION", "TOKEN"]),
+        ]);
+        assert_eq!(
+            out.stdout,
+            format!(
+                "{}export REGION='us'\nexport TOKEN='tp'\n",
+                next.state_exports()
+            )
+        );
+        // A replacement is not a collision.
+        assert!(out.notes.is_empty(), "{:?}", out.notes);
+    }
+
+    #[test]
+    fn an_unlinked_namespace_is_added_not_replaced() {
+        let s = stack_levels(
+            &[
+                ("work", LINKED_WORK),
+                ("personal", LINKED_PERSONAL),
+                ("tools", "[vars]\nT = \"t\"\n"),
+                ("gcp", "link = \"gcp\"\n\n[vars]\nG = \"g\"\n"),
+            ],
+            &[],
+        );
+        let store = store_of(&[("work", "TOKEN", "tw"), ("personal", "TOKEN", "tp")]);
+        let work = ("work", "user", &["REGION", "TOKEN"][..]);
+        // No link, or another group: added on top.
+        for (ns, vars) in [("tools", &["T"][..]), ("gcp", &["G"])] {
+            let out = activate_in(&s, &s.user, &store, ns, &stack_of(&[work])).unwrap();
+            let next = stack_of(&[work, (ns, "user", vars)]);
+            assert!(
+                out.stdout.starts_with(&next.state_exports()),
+                "{}",
+                out.stdout
+            );
+        }
+        // A linked member recorded from another level is never re-read, so
+        // never replaced: personal is added and wins both names.
+        let other = ("work", "/elsewhere/.envy", &["REGION", "TOKEN"][..]);
+        let out = activate_in(&s, &s.user, &store, "personal", &stack_of(&[other])).unwrap();
+        let next = stack_of(&[other, ("personal", "user", &["REGION", "TOKEN"])]);
+        assert_eq!(
+            out.stdout,
+            format!(
+                "{}export REGION='us'\nexport TOKEN='tp'\n",
+                next.state_exports()
+            )
+        );
+        assert_eq!(out.notes.len(), 2, "{:?}", out.notes);
+        // A recorded entry whose file is gone cannot be linked either.
+        let gone = ("old", "user", &["REGION"][..]);
+        let out = activate_in(&s, &s.user, &store, "personal", &stack_of(&[gone])).unwrap();
+        assert!(
+            out.stdout.contains("old\u{1f}user\u{1f}REGION"),
+            "{}",
+            out.stdout
+        );
+    }
+
+    #[test]
+    fn a_collision_prints_a_warning_with_names_only() {
+        let s = stack_levels(
+            &[
+                ("base", "[vars]\nS = \"@keychain\"\nA = \"zq-plain-a\"\n"),
+                ("work", "[vars]\nS = \"@keychain\"\nA = \"zq-plain-b\"\n"),
+            ],
+            &[],
+        );
+        let store = store_of(&[("base", "S", "zq-base-s"), ("work", "S", "zq-work-s")]);
+        let prev = stack_of(&[("base", "user", &["S", "A"])]);
+        let out = activate_in(&s, &s.user, &store, "work", &prev).unwrap();
+        assert_eq!(
+            out.notes,
+            [
+                "warning: S is set by both \"base\" and \"work\"; \"work\" wins (it was activated last)",
+                "warning: A is set by both \"base\" and \"work\"; \"work\" wins (it was activated last)",
+            ]
+        );
+        assert!(!out.notes.concat().contains("zq-"), "{:?}", out.notes);
+        assert!(
+            out.stdout
+                .ends_with("export S='zq-work-s'\nexport A='zq-plain-b'\n"),
+            "{}",
+            out.stdout
+        );
+    }
+
+    #[test]
+    fn reactivating_refreshes_and_moves_to_the_top() {
+        let s = stack_levels(
+            &[
+                ("base", "[vars]\nA = \"1\"\n"),
+                ("work", "[vars]\nB = \"@keychain\"\n"),
+            ],
+            &[],
+        );
+        let store = store_of(&[("work", "B", "new-b")]);
+        let prev = stack_of(&[("work", "user", &["B"]), ("base", "user", &["A"])]);
+        let out = activate_in(&s, &s.user, &store, "work", &prev).unwrap();
+        let next = stack_of(&[("base", "user", &["A"]), ("work", "user", &["B"])]);
+        // B is exported again: its value may have changed.
+        assert_eq!(
+            out.stdout,
+            format!("{}export B='new-b'\n", next.state_exports())
+        );
+        assert!(out.notes.is_empty(), "{:?}", out.notes);
+    }
+
+    #[test]
+    fn a_same_named_namespace_at_the_other_level_replaces_the_entry() {
+        let s = stack_levels(
+            &[("dev", "[vars]\nA = \"u\"\nU = \"u\"\n")],
+            &[("dev", "[vars]\nA = \"p\"\nP = \"@keychain\"\n")],
+        );
+        trust_now(&s.proj, "dev");
+        let store = store_of(&[("project/acme/api/dev", "P", "pp")]);
+        let here = label(&s.proj);
+        // User dev active; the project dev replaces it.
+        let prev = stack_of(&[("dev", "user", &["A", "U"])]);
+        let out = activate_in(&s, &s.proj, &store, "dev", &prev).unwrap();
+        let next = stack_of(&[("dev", &here, &["A", "P"])]);
+        assert_eq!(
+            out.stdout,
+            format!(
+                "unset U\n{}export A='p'\nexport P='pp'\n",
+                next.state_exports()
+            )
+        );
+        assert!(out.notes.is_empty(), "{:?}", out.notes);
+        // And back (`--user`).
+        let out = activate_in(&s, &s.user, &store, "dev", &next).unwrap();
+        let back = stack_of(&[("dev", "user", &["A", "U"])]);
+        assert_eq!(
+            out.stdout,
+            format!(
+                "unset P\n{}export A='u'\nexport U='u'\n",
+                back.state_exports()
+            )
+        );
+    }
+
+    #[test]
+    fn a_replaced_entrys_shadowed_var_is_restored_from_the_lower_entry() {
+        let s = stack_levels(
+            &[
+                ("base", "[vars]\nX = \"base-x\"\nK = \"@keychain\"\n"),
+                ("work", "[vars]\nW = \"w\"\n"),
+                ("aws1", "link = \"aws\"\n\n[vars]\nR = \"1\"\n"),
+                ("aws2", "link = \"aws\"\n\n[vars]\nR = \"2\"\n"),
+            ],
+            &[],
+        );
+        let store = store_of(&[("base", "K", "base-k")]);
+        // work used to define X and K too; refreshed, it no longer does.
+        let prev = stack_of(&[
+            ("base", "user", &["X", "K"]),
+            ("work", "user", &["X", "K", "W"]),
+        ]);
+        let out = activate_in(&s, &s.user, &store, "work", &prev).unwrap();
+        let next = stack_of(&[("base", "user", &["X", "K"]), ("work", "user", &["W"])]);
+        assert_eq!(
+            out.stdout,
+            format!(
+                "{}export X='base-x'\nexport K='base-k'\nexport W='w'\n",
+                next.state_exports()
+            )
+        );
+        assert!(out.notes.is_empty(), "{:?}", out.notes);
+
+        // A linked replacement that uncovers a lower owner.
+        let prev = stack_of(&[("base", "user", &["X"]), ("aws1", "user", &["R", "X"])]);
+        let out = activate_in(&s, &s.user, &store, "aws2", &prev).unwrap();
+        let next = stack_of(&[("base", "user", &["X"]), ("aws2", "user", &["R"])]);
+        assert_eq!(
+            out.stdout,
+            format!("{}export X='base-x'\nexport R='2'\n", next.state_exports())
+        );
+
+        // A lower secret no longer in the Keychain is left unset, with a note.
+        store.delete("base", "K").unwrap();
+        let prev = stack_of(&[("base", "user", &["K"]), ("work", "user", &["K", "W"])]);
+        let out = activate_in(&s, &s.user, &store, "work", &prev).unwrap();
+        let next = stack_of(&[("base", "user", &["K"]), ("work", "user", &["W"])]);
+        assert_eq!(
+            out.stdout,
+            format!("unset K\n{}export W='w'\n", next.state_exports())
+        );
+        assert_eq!(
+            out.notes,
+            [
+                "note: left unset: K (not in the Keychain for namespace \"base\"; run envy base to enter missing secrets)"
+            ]
+        );
+    }
+
+    #[test]
+    fn restore_skips_a_project_file_changed_since_confirmed_and_says_so() {
+        let s = stack_levels(
+            &[("work", "[vars]\nW = \"w\"\n")],
+            &[("base", "[vars]\nX = \"zq-confirmed\"\n")],
+        );
+        trust_now(&s.proj, "base");
+        let store = MemoryStore::default();
+        let here = label(&s.proj);
+        let prev = stack_of(&[
+            ("base", here.as_str(), &["X"]),
+            ("work", "user", &["X", "W"]),
+        ]);
+        let next = stack_of(&[("base", here.as_str(), &["X"]), ("work", "user", &["W"])]);
+        // Trusted as it is: restored.
+        let out = activate_in(&s, &s.user, &store, "work", &prev).unwrap();
+        assert_eq!(
+            out.stdout,
+            format!(
+                "{}export X='zq-confirmed'\nexport W='w'\n",
+                next.state_exports()
+            )
+        );
+        // Changed after it was confirmed: not read, left unset, and said so.
+        std::fs::write(
+            s.proj.dir().join("base.toml"),
+            "[vars]\nX = \"zq-pulled\"\n",
+        )
+        .unwrap();
+        let out = activate_in(&s, &s.user, &store, "work", &prev).unwrap();
+        assert_eq!(
+            out.stdout,
+            format!("unset X\n{}export W='w'\n", next.state_exports())
+        );
+        assert_eq!(
+            out.notes,
+            [format!(
+                "note: left unset: X (project namespace \"base\" in {here} has changed since you confirmed it; run envy base there to review it)"
+            )]
+        );
+        assert!(!out.stdout.contains("zq-") && !out.notes.concat().contains("zq-"));
+        // Never confirmed for this checkout at all: the same.
+        std::fs::remove_dir_all(s.user.dir().join("trust")).unwrap();
+        let out = activate_in(&s, &s.user, &store, "work", &prev).unwrap();
+        assert!(out.stdout.starts_with("unset X\n"), "{}", out.stdout);
+        assert_eq!(
+            out.notes,
+            [format!(
+                "note: left unset: X (project namespace \"base\" in {here} is not confirmed; run envy base there to review it)"
+            )]
+        );
+    }
+
+    #[test]
+    fn restore_from_another_folder_leaves_the_var_unset_and_names_the_folder() {
+        let s = stack_levels(&[("work", "[vars]\nW = \"w\"\n")], &[]);
+        let store = MemoryStore::default();
+        let prev = stack_of(&[
+            ("dev", "/Users/me/elsewhere/.envy", &["X", "Y"]),
+            ("work", "user", &["X", "Y", "W"]),
+        ]);
+        let out = activate_in(&s, &s.user, &store, "work", &prev).unwrap();
+        let next = stack_of(&[
+            ("dev", "/Users/me/elsewhere/.envy", &["X", "Y"]),
+            ("work", "user", &["W"]),
+        ]);
+        assert_eq!(
+            out.stdout,
+            format!("unset X Y\n{}export W='w'\n", next.state_exports())
+        );
+        assert_eq!(
+            out.notes,
+            [
+                "note: left unset: X, Y (namespace \"dev\" was loaded from /Users/me/elsewhere/.envy, which is not visible from this folder; run envy dev in that project to load it again)"
+            ]
+        );
+        // An entry from an older envy records no level: the same.
+        let mut old = prev.clone();
+        old.entries[0].source = None;
+        let out = activate_in(&s, &s.user, &store, "work", &old).unwrap();
+        assert!(out.stdout.starts_with("unset X Y\n"), "{}", out.stdout);
+        assert_eq!(
+            out.notes,
+            [
+                "note: left unset: X, Y (namespace \"dev\" was loaded by an older envy, so its level is unknown; run envy dev to load it again)"
+            ]
+        );
+    }
+
+    fn deactivate_in(
+        s: &StackLevels,
+        store: &dyn SecretStore,
+        ns: &str,
+        prev: &ActiveState,
+    ) -> Result<Activation> {
+        deactivate(store, &s.levels, ns, prev)
+    }
+
+    #[test]
+    fn off_one_removes_only_that_namespace() {
+        let s = stack_levels(&[], &[]);
+        let store = MemoryStore::default();
+        let prev = stack_of(&[
+            ("base", "user", &["A"]),
+            ("mid", "user", &["M", "N"]),
+            ("top", "user", &["T"]),
+        ]);
+        let out = deactivate_in(&s, &store, "mid", &prev).unwrap();
+        let next = stack_of(&[("base", "user", &["A"]), ("top", "user", &["T"])]);
+        assert_eq!(out.stdout, format!("unset M N\n{}", next.state_exports()));
+        assert!(out.notes.is_empty(), "{:?}", out.notes);
+        // The last one left: the state is cleared, as plain --off does.
+        let out =
+            deactivate_in(&s, &store, "only", &stack_of(&[("only", "user", &["O"])])).unwrap();
+        assert_eq!(
+            out.stdout,
+            format!("unset O\n{}", ActiveState::default().state_exports())
+        );
+    }
+
+    #[test]
+    fn off_one_restores_the_shadowed_value() {
+        let s = stack_levels(
+            &[
+                ("base", "[vars]\nX = \"base-x\"\nK = \"@keychain\"\n"),
+                ("work", "[vars]\nX = \"work-x\"\nW = \"w\"\n"),
+            ],
+            &[],
+        );
+        let store = store_of(&[("base", "K", "base-k")]);
+        let prev = stack_of(&[("base", "user", &["X", "K"]), ("work", "user", &["X", "W"])]);
+        let out = deactivate_in(&s, &store, "work", &prev).unwrap();
+        let next = stack_of(&[("base", "user", &["X", "K"])]);
+        assert_eq!(
+            out.stdout,
+            format!("unset W\n{}export X='base-x'\n", next.state_exports())
+        );
+        assert!(out.notes.is_empty(), "{:?}", out.notes);
+        // Removing the loser changes no value.
+        let out = deactivate_in(&s, &store, "base", &prev).unwrap();
+        let next = stack_of(&[("work", "user", &["X", "W"])]);
+        assert_eq!(out.stdout, format!("unset K\n{}", next.state_exports()));
+    }
+
+    #[test]
+    fn off_one_never_reads_an_untrusted_project_file_and_names_the_folder_when_not_visible() {
+        let s = stack_levels(
+            &[("work", "[vars]\nX = \"w\"\n")],
+            &[("base", "[vars]\nX = \"zq-pulled\"\nY = \"y\"\n")],
+        );
+        let store = MemoryStore::default();
+        let here = label(&s.proj);
+        // base was never confirmed here: not read, left unset, said so.
+        let prev = stack_of(&[("base", here.as_str(), &["X"]), ("work", "user", &["X"])]);
+        let out = deactivate_in(&s, &store, "work", &prev).unwrap();
+        assert!(out.stdout.starts_with("unset X\n"), "{}", out.stdout);
+        assert!(!out.stdout.contains("zq-"), "{}", out.stdout);
+        assert_eq!(
+            out.notes,
+            [format!(
+                "note: left unset: X (project namespace \"base\" in {here} is not confirmed; run envy base there to review it)"
+            )]
+        );
+        // An entry from a folder that is not visible: say where to run --off.
+        let prev = stack_of(&[
+            ("dev", "/Users/me/elsewhere/.envy", &["X"]),
+            ("work", "user", &["X"]),
+        ]);
+        let out = deactivate_in(&s, &store, "work", &prev).unwrap();
+        assert_eq!(
+            out.notes,
+            [
+                "note: left unset: X (namespace \"dev\" was loaded from /Users/me/elsewhere/.envy, which is not visible from this folder; run envy dev in that project to load it again, or envy --off dev there to remove it)"
+            ]
+        );
+    }
+
+    #[test]
+    fn off_one_needs_no_levels_when_nothing_is_restored() {
+        let store = MemoryStore::default();
+        let prev = stack_of(&[("a", "user", &["A"]), ("b", "/gone/.envy", &["B"])]);
+        let out = deactivate_lazy(&store, "b", &prev, || -> Result<Levels> {
+            panic!("levels were asked for")
+        })
+        .unwrap();
+        assert!(out.stdout.starts_with("unset B\n"), "{}", out.stdout);
+        assert!(out.notes.is_empty());
+    }
+
+    #[test]
+    fn off_one_with_user_only_levels_leaves_project_entries_unset() {
+        let s = stack_levels(&[("work", "[vars]\nX = \"w\"\n")], &[]);
+        let store = MemoryStore::default();
+        let here = label(&s.proj);
+        // The project entry would be readable if the levels were discovered;
+        // with only the user level it is "not visible" and is never read.
+        let prev = stack_of(&[("dev", here.as_str(), &["X"]), ("work", "user", &["X"])]);
+        let user = s.user.clone();
+        let out = deactivate_lazy(&store, "work", &prev, || Ok(Levels::user_only(user))).unwrap();
+        assert!(out.stdout.starts_with("unset X\n"), "{}", out.stdout);
+        assert_eq!(
+            out.notes,
+            [format!(
+                "note: left unset: X (namespace \"dev\" was loaded from {here}, which is not visible from this folder; run envy dev in that project to load it again, or envy --off dev there to remove it)"
+            )]
+        );
+    }
+
+    #[test]
+    fn off_of_an_inactive_name_fails_and_changes_nothing() {
+        let s = stack_levels(&[("base", "[vars]\nA = \"1\"\n")], &[]);
+        let store = store_of(&[("base", "K", "zq-k")]);
+        let before = store.snapshot();
+        let prev = stack_of(&[("base", "user", &["A"])]);
+        let err = deactivate_in(&s, &store, "nope", &prev).unwrap_err();
+        assert_eq!(err.to_string(), "namespace \"nope\" is not active");
+        assert_eq!(store.snapshot(), before);
+    }
+
+    #[test]
+    fn a_failed_secret_read_on_removal_prints_nothing() {
+        let s = stack_levels(&[("base", "[vars]\nK = \"@keychain\"\n")], &[]);
+        let store = FailingGet {
+            inner: store_of(&[("base", "K", "zq-base-k")]),
+            fail_on: "K",
+        };
+        let prev = stack_of(&[("base", "user", &["K"]), ("work", "user", &["K"])]);
+        let err = deactivate_in(&s, &store, "work", &prev).unwrap_err();
+        let msg = format!("{err:#} {err:?}");
+        assert!(msg.contains('K') && !msg.contains("zq-"), "{msg}");
+    }
+
+    #[test]
+    fn off_all_still_clears_everything_from_a_damaged_stack() {
+        // Per-entry data is gone; only the flat union of names is left.
+        let damaged = ActiveState::from_env(|k| match k {
+            "ENVY_STACK" => Some("\u{1f}\u{1f}garbage;rm -rf".to_string()),
+            "ENVY_VARS" => Some("A B bad;name C".to_string()),
+            _ => None,
+        });
+        let out = crate::activate::render_off(&damaged);
+        assert_eq!(
+            out,
+            format!(
+                "unset {}\n{}",
+                damaged.all_vars().join(" "),
+                ActiveState::default().state_exports()
+            )
+        );
+        assert!(out.starts_with("unset A B C\n"), "{out}");
+    }
+
+    #[test]
+    fn restore_with_duplicate_names_in_state_reads_the_matching_owner() {
+        let s = stack_levels(
+            &[("dup", "[vars]\nX = \"user-x\"\n")],
+            &[("dup", "[vars]\nX = \"proj-x\"\n")],
+        );
+        trust_now(&s.proj, "dup");
+        let here = label(&s.proj);
+        let store = MemoryStore::default();
+        // The same name from two levels (tampered state); the last one wins X.
+        for (first, second, want) in [
+            ("user", here.as_str(), "proj-x"),
+            (here.as_str(), "user", "user-x"),
+        ] {
+            let state = stack_of(&[("dup", first, &["X"]), ("dup", second, &["X"])]);
+            let export = Export {
+                var: "X".into(),
+                from: "dup".into(),
+            };
+            let (values, notes) = restore_values(
+                &s.levels,
+                &store,
+                &state,
+                &[export],
+                None,
+                Restoring::Removal,
+            )
+            .unwrap();
+            assert_eq!(values.get("X").map(String::as_str), Some(want));
+            assert!(notes.is_empty(), "{notes:?}");
+        }
+    }
+
+    /// A store whose `get` fails for one variable name.
+    struct FailingGet {
+        inner: MemoryStore,
+        fail_on: &'static str,
+    }
+
+    impl SecretStore for FailingGet {
+        fn get(&self, ns: &str, name: &str) -> Result<Option<Secret>> {
+            if name == self.fail_on {
+                bail!("simulated Keychain read failure");
+            }
+            self.inner.get(ns, name)
+        }
+        fn contains(&self, ns: &str, name: &str) -> Result<bool> {
+            self.inner.contains(ns, name)
+        }
+        fn set(&self, ns: &str, name: &str, value: &Secret) -> Result<()> {
+            self.inner.set(ns, name, value)
+        }
+        fn delete(&self, ns: &str, name: &str) -> Result<()> {
+            self.inner.delete(ns, name)
+        }
+    }
+
+    #[test]
+    fn a_failed_secret_read_prints_nothing_and_changes_no_state() {
+        let s = stack_levels(
+            &[
+                ("base", "[vars]\nK = \"@keychain\"\n"),
+                ("work", "[vars]\nW = \"@keychain\"\nV = \"@keychain\"\n"),
+            ],
+            &[],
+        );
+        let items = [
+            ("base", "K", "zq-base-k"),
+            ("work", "W", "zq-work-w"),
+            ("work", "V", "zq-work-v"),
+        ];
+        let prev = stack_of(&[("base", "user", &["K"]), ("work", "user", &["K", "W", "V"])]);
+        // The added namespace's own secret, then a restored one.
+        for fail_on in ["V", "K"] {
+            let store = FailingGet {
+                inner: store_of(&items),
+                fail_on,
+            };
+            let before = store.inner.snapshot();
+            let err = activate_in(&s, &s.user, &store, "work", &prev).unwrap_err();
+            let msg = format!("{err:#} {err:?}");
+            assert!(msg.contains(fail_on), "{msg}");
+            assert!(!msg.contains("zq-"), "{msg}");
+            assert_eq!(store.inner.snapshot(), before);
+        }
+    }
+
+    #[test]
+    fn stdout_contains_a_secret_only_in_its_export_line() {
+        let s = stack_levels(
+            &[
+                ("base", "[vars]\nK = \"@keychain\"\nL = \"@keychain\"\n"),
+                ("work", "[vars]\nK = \"@keychain\"\nJ = \"@keychain\"\n"),
+            ],
+            &[],
+        );
+        let store = store_of(&[
+            ("base", "K", "zq-base-k"),
+            ("base", "L", "zq-base-l"),
+            ("work", "K", "zq-work-k"),
+            ("work", "J", "zq-work-j"),
+        ]);
+        // Added on top (a collision), then refreshed without K (a restore).
+        let prev = stack_of(&[("base", "user", &["K", "L"])]);
+        let added = activate_in(&s, &s.user, &store, "work", &prev).unwrap();
+        std::fs::write(
+            s.user.dir().join("work.toml"),
+            "[vars]\nJ = \"@keychain\"\n",
+        )
+        .unwrap();
+        let prev = stack_of(&[("base", "user", &["K", "L"]), ("work", "user", &["K", "J"])]);
+        let refreshed = activate_in(&s, &s.user, &store, "work", &prev).unwrap();
+        for (act, secrets) in [
+            (&added, &[("K", "zq-work-k"), ("J", "zq-work-j")][..]),
+            (&refreshed, &[("K", "zq-base-k"), ("J", "zq-work-j")]),
+        ] {
+            for (var, value) in secrets {
+                let lines: Vec<&str> = act.stdout.lines().filter(|l| l.contains(value)).collect();
+                assert_eq!(lines, [format!("export {var}='{value}'")], "{}", act.stdout);
+            }
+            assert_eq!(
+                act.stdout.matches("zq-").count(),
+                secrets.len(),
+                "{}",
+                act.stdout
+            );
+            assert!(!act.notes.concat().contains("zq-"), "{:?}", act.notes);
+            assert!(!format!("{act:?}").contains("zq-"), "{act:?}");
+        }
     }
 }
