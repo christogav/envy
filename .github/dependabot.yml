@@ -1,0 +1,21 @@
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: deps
+    # Wait a few days after a release before proposing it. Security updates
+    # ignore the cooldown and arrive immediately.
+    cooldown:
+      default-days: 4
+    groups:
+      # One PR per week for ordinary updates; major updates arrive separately.
+      minor-and-patch:
+        update-types: [minor, patch]
+
+# GitHub Actions are deliberately not updated here. Dependabot can't exclude
+# a single file, and its bumps would edit .github/workflows/release.yml, which
+# cargo-dist generates (an edited copy makes `dist plan` fail on every PR).
