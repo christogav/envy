@@ -77,13 +77,38 @@ The line is required: it defines the shell function that makes loading work.
 
 ```console
 $ envy work --new                              # create a namespace called "work"
-$ envy work --secret GITHUB_TOKEN              # hidden prompt, stored in the Keychain
-$ envy work --plain AWS_REGION=eu-west-1       # no prompt, stored in a readable file
+$ envy work --secret GITHUB_TOKEN OPENAI_KEY \
+    --plain AWS_REGION=eu-west-1 AWS_PROFILE   # see below
 $ envy work                                    # load it into this shell
 $ echo $AWS_REGION
 eu-west-1
 $ envy --off                                   # take everything back out
 ```
+
+The second command takes any number of names. You are asked for each secret at
+a hidden prompt, and for `AWS_PROFILE` at a visible one because you gave no
+value; `AWS_REGION=eu-west-1` is stored as typed, with no prompt. Everything is
+asked first and saved together, so cancelling any prompt changes nothing.
+
+### What gets stored where
+
+The namespace file, `~/.config/envy/work.toml`, ends up like this:
+
+```toml
+[vars]
+GITHUB_TOKEN = "@keychain"   # a marker, not a value
+OPENAI_KEY = "@keychain"
+AWS_REGION = "eu-west-1"
+AWS_PROFILE = "prod"
+```
+
+`@keychain` is a marker meaning "this one is a secret". The real value is in
+your login Keychain, filed under `envy.work` with the variable name as the
+account, and the file never holds it. That is the benefit: the file is safe to
+open, diff, back up or commit, because there is nothing in it to steal. Your
+secrets stay out of dotfiles, backups and git history, and envy reads them from
+the Keychain only when it loads them into your shell. It is also what makes
+[committing a project's `.envy/` folder](#project-config) safe.
 
 ## Everyday commands
 
@@ -94,7 +119,7 @@ $ envy --off                                   # take everything back out
 | `envy --off` | Remove everything envy set. |
 | `envy` | List your namespaces and mark the loaded ones with `*`. |
 | `envy <ns> --list` | Show a namespace's variables (secrets are never shown). |
-| `envy <ns> --secret NAME` / `--plain NAME=value` | Add a secret (hidden prompt) or a plain value. |
+| `envy <ns> --secret NAME...` / `--plain NAME[=value]...` | Add secrets (hidden prompts) or plain values (given inline, or asked for if you give just the name). |
 | `envy <ns> --new` / `--edit` / `--rm` | Create, edit or delete a namespace. |
 
 Every command, with the details: [command reference](docs/commands.md).
