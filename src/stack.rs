@@ -234,7 +234,12 @@ pub fn transition(prev: &ActiveState, change: &Change) -> Result<Transition> {
         }
         Change::Remove { namespace } => {
             if prev.entry(namespace).is_none() {
-                bail!("{namespace} is not active");
+                if prev.extra_vars.is_empty() {
+                    bail!("namespace {namespace:?} is not active");
+                }
+                bail!(
+                    "namespace {namespace:?} is not active (the recorded state looks damaged: run envy --off to remove everything)"
+                );
             }
             entries.retain(|e| &e.namespace != namespace);
         }
@@ -621,7 +626,20 @@ mod tests {
             },
         )
         .unwrap_err();
-        assert_eq!(err.to_string(), "nope is not active");
+        assert_eq!(err.to_string(), "namespace \"nope\" is not active");
+        let mut damaged = state(&[]);
+        damaged.extra_vars = vec!["X".into()];
+        let err = transition(
+            &damaged,
+            &Change::Remove {
+                namespace: "work".into(),
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "namespace \"work\" is not active (the recorded state looks damaged: run envy --off to remove everything)"
+        );
     }
 
     #[test]

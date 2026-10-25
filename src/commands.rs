@@ -132,14 +132,37 @@ pub fn deactivate(
     ns: &str,
     prev: &ActiveState,
 ) -> Result<Activation> {
+    deactivate_lazy(store, ns, prev, || Ok(levels))
+}
+
+/// [`deactivate`], but the levels are only asked for (`levels`) when a
+/// variable has to be restored; removing a namespace that shadowed nothing
+/// never needs them.
+pub fn deactivate_lazy<L: std::borrow::Borrow<Levels>>(
+    store: &dyn SecretStore,
+    ns: &str,
+    prev: &ActiveState,
+    levels: impl FnOnce() -> Result<L>,
+) -> Result<Activation> {
     let t = transition(
         prev,
         &StackChange::Remove {
             namespace: ns.to_string(),
         },
     )?;
-    let (values, notes) =
-        restore_values(levels, store, &t.next, &t.export, None, Restoring::Removal)?;
+    let (values, notes) = if t.export.is_empty() {
+        Default::default()
+    } else {
+        let levels = levels()?;
+        restore_values(
+            levels.borrow(),
+            store,
+            &t.next,
+            &t.export,
+            None,
+            Restoring::Removal,
+        )?
+    };
     Ok(Activation {
         stdout: render_transition(&t, &values),
         notes,
@@ -279,9 +302,9 @@ fn restore_one(
     let Some(cfg) = levels.config_for(source) else {
         let how = match why {
             Restoring::Activation => format!("run envy {ns} in that project to load it again"),
-            Restoring::Removal => {
-                format!("run envy --off {ns} from that project's folder to remove it")
-            }
+            Restoring::Removal => format!(
+                "run envy {ns} in that project to load it again, or envy --off {ns} there to remove it"
+            ),
         };
         return Ok(Err(format!(
             "namespace {ns:?} was loaded from {source}, which is not visible from this folder; {how}"
@@ -6143,8 +6166,39 @@ mod tests {
         assert_eq!(
             out.notes,
             [
-                "note: left unset: X (namespace \"dev\" was loaded from /Users/me/elsewhere/.envy, which is not visible from this folder; run envy --off dev from that project's folder to remove it)"
+                "note: left unset: X (namespace \"dev\" was loaded from /Users/me/elsewhere/.envy, which is not visible from this folder; run envy dev in that project to load it again, or envy --off dev there to remove it)"
             ]
+        );
+    }
+
+    #[test]
+    fn off_one_needs_no_levels_when_nothing_is_restored() {
+        let store = MemoryStore::default();
+        let prev = stack_of(&[("a", "user", &["A"]), ("b", "/gone/.envy", &["B"])]);
+        let out = deactivate_lazy(&store, "b", &prev, || -> Result<Levels> {
+            panic!("levels were asked for")
+        })
+        .unwrap();
+        assert!(out.stdout.starts_with("unset B\n"), "{}", out.stdout);
+        assert!(out.notes.is_empty());
+    }
+
+    #[test]
+    fn off_one_with_user_only_levels_leaves_project_entries_unset() {
+        let s = stack_levels(&[("work", "[vars]\nX = \"w\"\n")], &[]);
+        let store = MemoryStore::default();
+        let here = label(&s.proj);
+        // The project entry would be readable if the levels were discovered;
+        // with only the user level it is "not visible" and is never read.
+        let prev = stack_of(&[("dev", here.as_str(), &["X"]), ("work", "user", &["X"])]);
+        let user = s.user.clone();
+        let out = deactivate_lazy(&store, "work", &prev, || Ok(Levels::user_only(user))).unwrap();
+        assert!(out.stdout.starts_with("unset X\n"), "{}", out.stdout);
+        assert_eq!(
+            out.notes,
+            [format!(
+                "note: left unset: X (namespace \"dev\" was loaded from {here}, which is not visible from this folder; run envy dev in that project to load it again, or envy --off dev there to remove it)"
+            )]
         );
     }
 
@@ -6155,7 +6209,7 @@ mod tests {
         let before = store.snapshot();
         let prev = stack_of(&[("base", "user", &["A"])]);
         let err = deactivate_in(&s, &store, "nope", &prev).unwrap_err();
-        assert_eq!(err.to_string(), "nope is not active");
+        assert_eq!(err.to_string(), "namespace \"nope\" is not active");
         assert_eq!(store.snapshot(), before);
     }
 

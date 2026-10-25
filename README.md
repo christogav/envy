@@ -230,8 +230,9 @@ state. So a restore never prompts, and never exports from a project file that
 is not trusted (changed since you confirmed it, or never confirmed for this
 checkout): those variables stay unset, and envy says which on stderr. A
 namespace loaded from a project folder you have since left cannot be read
-again either: the variables it was winning stay unset, and the message names the
-folder to run `envy --off <ns>` from. Plain `envy --off` always unsets
+again either: the variables it was winning stay unset, and the message says to
+run `envy <name>` in that project to load it again (or `envy --off <name>`
+there to remove it), where `<name>` is the namespace that was loaded from it. Plain `envy --off` always unsets
 everything.
 
 ## Namespace files

@@ -133,8 +133,8 @@ impl Levels {
         &self.notes
     }
 
-    /// No project level: what [`Levels::discover`] finds outside any project.
-    #[cfg(test)]
+    /// No project level: what [`Levels::discover`] finds outside any project,
+    /// and the fallback when discovery is unavailable.
     pub fn user_only(user: Config) -> Levels {
         Levels {
             projects: Vec::new(),

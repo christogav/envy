@@ -64,9 +64,10 @@ it instead, and loading a name again moves it to the top. `envy --off <name>`
 removes one namespace (a variable it was winning gets its value back from the
 next namespace that sets it); `envy --off` removes them all. Secrets live in
 the macOS Keychain; plain values and the names live in
-~/.config/envy/<namespace>.toml (or in $ENVY_CONFIG_DIR). Run `envy --list` (or `envy` alone) to list the namespaces,
-and `envy <namespace> --list` (alias `--ls`) to show a namespace's variables:
-plain values are shown, secret values never are.
+~/.config/envy/<namespace>.toml (or in $ENVY_CONFIG_DIR). Run `envy --list`
+(or `envy` alone) to list the namespaces, and `envy <namespace> --list` (alias
+`--ls`) to show a namespace's variables: plain values are shown, secret values
+never are.
 
 A namespace can also live in a project's .envy/ folder. A name resolves to the
 project's namespace first, then your own; `envy <namespace> --user` uses your

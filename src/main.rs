@@ -114,9 +114,16 @@ fn run(command: Command) -> Result<String> {
         Action::OffNamed(ns) => {
             // The output holds secret exports (restored values).
             check_emit()?;
-            let here = Here::discover()?;
-            let activation =
-                commands::deactivate(&MacKeychain, &here.levels, &ns, &active_state())?;
+            // Levels are only needed to restore a shadowed variable. If they
+            // cannot be discovered (say the current directory was deleted),
+            // fall back to the user level alone: project entries are then
+            // "not visible from here" and are never read.
+            let activation = commands::deactivate_lazy(&MacKeychain, &ns, &active_state(), || {
+                match Here::discover() {
+                    Ok(here) => Ok(here.levels),
+                    Err(_) => Ok(Levels::user_only(Config::from_env()?)),
+                }
+            })?;
             for note in &activation.notes {
                 eprintln!("{note}");
             }
