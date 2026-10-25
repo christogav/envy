@@ -25,3 +25,22 @@ jobs:
       # The real-Keychain test stays #[ignore]d: runners have no unlocked
       # login keychain.
       - run: cargo test
+
+  # We ship an Intel binary, so run the tests on Intel too (macos-latest is
+  # Apple Silicon). fmt and clippy are architecture independent.
+  test-intel:
+    name: test (Intel)
+    runs-on: macos-15-intel
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo test
+
+  # Keeps rust-version in Cargo.toml honest: it must build, with the committed
+  # Cargo.lock, on the oldest toolchain we claim to support.
+  msrv:
+    name: msrv (1.88)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install 1.88 --profile minimal
+      - run: cargo +1.88 check --locked --all-targets

@@ -2,6 +2,7 @@
 name = "envy"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
 license = "MIT"
 description = "Load Keychain secrets and variables into your current zsh shell, by namespace"
 homepage = "https://github.com/christogav/envy"
