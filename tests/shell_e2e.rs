@@ -1320,18 +1320,18 @@ fn e2e_the_listing_stars_the_level_that_was_loaded() {
         &p.repo,
         &format!(
             r#"envy dev --user
-print -r -- "[$ENVY_SOURCE]"
+print -r -- "[${{${{(ps:\x1f:)ENVY_STACK}}[2]}}]"
 envy
 cd {home}
 envy
 cd {repo}
 envy dev
-print -r -- "[$ENVY_SOURCE]"
+print -r -- "[${{${{(ps:\x1f:)ENVY_STACK}}[2]}}]"
 envy
 cd {home}
 envy
 envy --off
-print -r -- "[${{ENVY_SOURCE-unset}}]"
+print -r -- "[${{ENVY_STACK-unset}}]"
 "#,
             home = sh_quote(&p.home.display().to_string()),
             repo = sh_quote(&p.repo.display().to_string()),
@@ -1575,7 +1575,7 @@ fn e2e_a_user_config_dir_named_envy_is_still_the_user_level() {
     std::fs::create_dir_all(&conf).unwrap();
     std::fs::write(conf.join("dev.toml"), USER_DEV).unwrap();
     let script = format!(
-        "export ENVY_CONFIG_DIR={}\nenvy dev\nprint -r -- \"$WHERE|$ENVY_SOURCE\"\nenvy\n",
+        "export ENVY_CONFIG_DIR={}\nenvy dev\nprint -r -- \"$WHERE|${{${{(ps:\x1f:)ENVY_STACK}}[2]}}\"\nenvy\n",
         sh_quote(&conf.display().to_string())
     );
     let out = p.zsh(&dots, &script);

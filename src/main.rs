@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use anyhow::{Context, Result, bail};
-use envy::activate::{ActiveState, render_off};
+use envy::activate::render_off;
 use envy::cli::{self, Action, Command, Scope};
 use envy::commands::{self, Ctx};
 use envy::config::Config;
@@ -14,6 +14,7 @@ use envy::levels::{Levels, shadow_note};
 use envy::link;
 use envy::project::encode_path;
 use envy::prompt::TtyPrompter;
+use envy::stack::ActiveState;
 use envy::store::MacKeychain;
 
 /// Stops core dumps, which would write secrets held in memory to disk.

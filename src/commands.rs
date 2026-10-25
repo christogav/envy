@@ -8,7 +8,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 
-use crate::activate::{ActiveState, render_activate};
+use crate::activate::render_activate;
 use crate::config::{Config, NamespaceFile, SECRET_MARKER, Value};
 use crate::display::quote_for_display;
 use crate::levels::{Entry, Level, Levels, label};
@@ -17,6 +17,7 @@ use crate::names::{validate_namespace, validate_var};
 use crate::project::encode_path;
 use crate::prompt::{Prompter, plain_label, secret_label, vet_plain};
 use crate::secret::Secret;
+use crate::stack::ActiveState;
 use crate::store::SecretStore;
 use crate::trust::{Purpose, TrustStore, confirmation_text_for};
 
@@ -242,13 +243,16 @@ pub fn status(levels: &Levels, active: &ActiveState) -> Result<String> {
         out.push_str("user:\n");
         out.push_str(&block(&Level::User));
     }
-    if let Some(ns) = active.namespace.as_deref()
-        && !entries.iter().any(|e| e.name == ns && starred(e))
+    if let Some(current) = active.entries.last()
+        && !entries
+            .iter()
+            .any(|e| e.name == current.namespace && starred(e))
     {
+        let ns = current.namespace.as_str();
         // An old shell (no source) with an ambiguous name marks nothing and
         // adds nothing: the name does exist.
-        let ambiguous = active.source.is_none() && count(ns) > 1;
-        let elsewhere = match active.source.as_deref() {
+        let ambiguous = current.source.is_none() && count(ns) > 1;
+        let elsewhere = match current.source.as_deref() {
             None | Some("user") => false,
             Some(src) => !levels.projects().iter().any(|p| label(p) == src),
         };
@@ -276,10 +280,10 @@ fn is_active(
     shadowed: bool,
     count: impl FnOnce() -> Result<usize>,
 ) -> Result<bool> {
-    if active.namespace.as_deref() != Some(name) {
+    let Some(current) = active.entries.last().filter(|e| e.namespace == name) else {
         return Ok(false);
-    }
-    Ok(match active.source.as_deref() {
+    };
+    Ok(match current.source.as_deref() {
         Some(source) => source == level,
         None => !shadowed && count()? <= 1,
     })
@@ -1042,11 +1046,7 @@ mod tests {
     /// `ns` active, loaded from the level labelled `source` (`None`: a
     /// shell from before `ENVY_SOURCE` existed).
     fn act(ns: &str, source: Option<&str>) -> ActiveState {
-        ActiveState {
-            namespace: Some(ns.into()),
-            vars: vec!["A".into()],
-            source: source.map(str::to_string),
-        }
+        ActiveState::single(ns, source, &["A"])
     }
 
     /// The nested listing with `marks` (one char per row, in order: inner
@@ -1289,11 +1289,7 @@ mod tests {
             ),
             ("personal", "[vars]\nC = \"other-value-456\"\n"),
         ]);
-        let active = ActiveState {
-            namespace: Some("work".into()),
-            vars: vec!["A".into(), "B".into()],
-            source: Some("user".into()),
-        };
+        let active = ActiveState::single("work", Some("user"), &["A", "B"]);
         let out = status(&user_levels(&cfg), &active).unwrap();
         assert_eq!(out, "  personal\n* work\n");
         assert!(!out.contains("value"));
@@ -1344,11 +1340,7 @@ mod tests {
             ("dev", "link = \"aws\"\n[vars]\nA = \"1\"\n"),
             ("prod", "[vars]\nA = \"2\"\n"),
         ]);
-        let active = ActiveState {
-            namespace: Some("dev".into()),
-            vars: vec!["A".into()],
-            source: Some("user".into()),
-        };
+        let active = ActiveState::single("dev", Some("user"), &["A"]);
         assert_eq!(
             list_vars(&user_levels(&cfg), "dev", false, &active).unwrap(),
             "namespace: dev (active)\nsource: user\nlink: aws\n\nA  \"1\"\n"
@@ -1491,11 +1483,7 @@ mod tests {
     #[test]
     fn status_flags_active_namespace_that_no_longer_exists() {
         let (_dir, cfg) = config_with(&[("work", "")]);
-        let active = ActiveState {
-            namespace: Some("gone".into()),
-            vars: vec![],
-            source: Some("user".into()),
-        };
+        let active = ActiveState::single("gone", Some("user"), &[]);
         assert_eq!(
             status(&user_levels(&cfg), &active).unwrap(),
             "  work\n* gone (no longer exists)\n"
@@ -1516,7 +1504,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             out,
-            "export ENVY_ACTIVE='work'\nexport ENVY_SOURCE='user'\nexport ENVY_VARS='A B'\nexport A='x'\nexport B='s'\n"
+            "export ENVY_ACTIVE='work'\nexport ENVY_STACK='work\u{1f}user\u{1f}A B'\nexport ENVY_VARS='A B'\nunset ENVY_SOURCE\nexport A='x'\nexport B='s'\n"
         );
     }
 
@@ -3617,7 +3605,7 @@ mod tests {
         assert_eq!(
             out,
             format!(
-                "export ENVY_ACTIVE='dev'\nexport ENVY_SOURCE='{}'\nexport ENVY_VARS='REGION TOKEN API_KEY'\n\
+                "export ENVY_ACTIVE='dev'\nexport ENVY_STACK='dev\u{1f}{}\u{1f}REGION TOKEN API_KEY'\nexport ENVY_VARS='REGION TOKEN API_KEY'\nunset ENVY_SOURCE\n\
                  export REGION='eu'\nexport TOKEN='tok-1'\nexport API_KEY='key-1'\n",
                 encode_path(cfg.dir())
             )
@@ -3915,7 +3903,7 @@ mod tests {
             out_a.replace(&encode_path(a.dir()), "<checkout>"),
             out_b.replace(&encode_path(b.dir()), "<checkout>")
         );
-        assert!(out_b.contains(&format!("export ENVY_SOURCE='{}'\n", encode_path(b.dir()))));
+        assert!(out_b.contains(&format!("\u{1f}{}\u{1f}", encode_path(b.dir()))));
         let asked = second.asked();
         assert_eq!(asked.len(), 1, "{asked:?}");
         let Asked::Confirm(text) = &asked[0] else {

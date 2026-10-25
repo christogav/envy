@@ -1,49 +1,9 @@
 use anyhow::{Context, Result, bail};
 
 use crate::config::{NamespaceFile, Value};
-use crate::names::{validate_namespace, validate_var};
 use crate::quote::shell_quote;
+use crate::stack::ActiveState;
 use crate::store::SecretStore;
-
-/// The longest `ENVY_SOURCE` accepted back from the environment.
-const MAX_SOURCE: usize = 4096;
-
-/// What the current shell has already activated, as recorded in `ENVY_ACTIVE`,
-/// `ENVY_VARS` and `ENVY_SOURCE`.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct ActiveState {
-    pub namespace: Option<String>,
-    pub vars: Vec<String>,
-    /// Which level the namespace was loaded from: `user`, or the encoded path
-    /// of a project's `.envy` folder (see [`crate::levels::label`]). For
-    /// display only: compared by exact equality with a level's label, never
-    /// written into shell code or used as a path. `None` for a shell from
-    /// before it existed, or a value that is not plausible.
-    pub source: Option<String>,
-}
-
-impl ActiveState {
-    /// Reads the previous state from the environment. The environment is
-    /// untrusted, so every token that is not a valid variable name is dropped:
-    /// tampered state can never inject text into the `unset` line.
-    pub fn from_env(get: impl Fn(&str) -> Option<String>) -> Self {
-        let namespace = get("ENVY_ACTIVE").filter(|ns| validate_namespace(ns).is_ok());
-        let vars = get("ENVY_VARS")
-            .unwrap_or_default()
-            .split_whitespace()
-            .filter(|tok| validate_var(tok).is_ok())
-            .map(str::to_string)
-            .collect();
-        let source = get("ENVY_SOURCE").filter(|s| {
-            !s.is_empty() && s.len() <= MAX_SOURCE && s.bytes().all(|b| (0x20..=0x7e).contains(&b))
-        });
-        Self {
-            namespace,
-            vars,
-            source,
-        }
-    }
-}
 
 fn unset_line(vars: &[String]) -> String {
     if vars.is_empty() {
@@ -54,8 +14,8 @@ fn unset_line(vars: &[String]) -> String {
 }
 
 /// Renders the shell text that switches to `ns`: unset the previous
-/// variables, record the new state (`ENVY_ACTIVE`, `ENVY_SOURCE` = `source`,
-/// the label of the level `ns` was loaded from, and `ENVY_VARS`), then export
+/// variables, record the new state (a stack of one entry: `ns`, `source`, the
+/// label of the level `ns` was loaded from, and its variables), then export
 /// the new variables. Every secret is fetched before any
 /// output is built, so a failure returns `Err` with nothing emitted.
 ///
@@ -88,14 +48,9 @@ pub fn render_activate(
     // The state is recorded before the variables are exported: if the shell
     // stops partway through the exports, ENVY_VARS already lists every name,
     // so `envy --off` (or the next switch) still unsets whatever was set.
-    let mut out = unset_line(&prev.vars);
+    let mut out = unset_line(&prev.all_vars());
     let names: Vec<&str> = resolved.iter().map(|(n, _)| n.as_str()).collect();
-    out.push_str(&format!("export ENVY_ACTIVE={}\n", shell_quote(ns.name())));
-    out.push_str(&format!("export ENVY_SOURCE={}\n", shell_quote(source)));
-    out.push_str(&format!(
-        "export ENVY_VARS={}\n",
-        shell_quote(&names.join(" "))
-    ));
+    out.push_str(&ActiveState::single(ns.name(), Some(source), &names).state_exports());
     for (name, text) in &resolved {
         out.push_str(&format!("export {name}={}\n", shell_quote(text)));
     }
@@ -105,8 +60,9 @@ pub fn render_activate(
 /// Renders the shell text that deactivates whatever `prev` describes.
 pub fn render_off(prev: &ActiveState) -> String {
     format!(
-        "{}unset ENVY_ACTIVE ENVY_SOURCE ENVY_VARS\n",
-        unset_line(&prev.vars)
+        "{}{}",
+        unset_line(&prev.all_vars()),
+        ActiveState::default().state_exports()
     )
 }
 
@@ -117,12 +73,10 @@ mod tests {
     use crate::store::MemoryStore;
 
     fn state(vars: &[&str]) -> ActiveState {
-        ActiveState {
-            namespace: Some("old".into()),
-            vars: vars.iter().map(|v| v.to_string()).collect(),
-            source: Some("user".into()),
-        }
+        ActiveState::single("old", Some("user"), vars)
     }
+
+    const S: &str = "\u{1f}";
 
     fn work() -> NamespaceFile {
         NamespaceFile::parse("work", "[vars]\nB = \"x\"\nC = \"@keychain\"\n").unwrap()
@@ -141,7 +95,9 @@ mod tests {
         let out = render_activate(&work(), "user", &state(&["A", "B"]), &store_with_c()).unwrap();
         assert_eq!(
             out,
-            "unset A B\nexport ENVY_ACTIVE='work'\nexport ENVY_SOURCE='user'\nexport ENVY_VARS='B C'\nexport B='x'\nexport C='s3cret'\n"
+            format!(
+                "unset A B\nexport ENVY_ACTIVE='work'\nexport ENVY_STACK='work{S}user{S}B C'\nexport ENVY_VARS='B C'\nunset ENVY_SOURCE\nexport B='x'\nexport C='s3cret'\n"
+            )
         );
     }
 
@@ -151,7 +107,9 @@ mod tests {
             render_activate(&work(), "user", &ActiveState::default(), &store_with_c()).unwrap();
         assert_eq!(
             out,
-            "export ENVY_ACTIVE='work'\nexport ENVY_SOURCE='user'\nexport ENVY_VARS='B C'\nexport B='x'\nexport C='s3cret'\n"
+            format!(
+                "export ENVY_ACTIVE='work'\nexport ENVY_STACK='work{S}user{S}B C'\nexport ENVY_VARS='B C'\nunset ENVY_SOURCE\nexport B='x'\nexport C='s3cret'\n"
+            )
         );
     }
 
@@ -166,7 +124,9 @@ mod tests {
         .unwrap();
         assert_eq!(
             out,
-            "export ENVY_ACTIVE='work'\nexport ENVY_SOURCE='/Users/me/src/it'\\''s api/.envy'\nexport ENVY_VARS='B C'\nexport B='x'\nexport C='s3cret'\n"
+            format!(
+                "export ENVY_ACTIVE='work'\nexport ENVY_STACK='work{S}/Users/me/src/it'\\''s api/.envy{S}B C'\nexport ENVY_VARS='B C'\nunset ENVY_SOURCE\nexport B='x'\nexport C='s3cret'\n"
+            )
         );
     }
 
@@ -178,10 +138,9 @@ mod tests {
             _ => None,
         };
         let s = ActiveState::from_env(env);
-        assert_eq!(s.source.as_deref(), Some("/Users/me/src/api/.envy"));
         assert_eq!(
-            ActiveState::from_env(|k| (k == "ENVY_SOURCE").then(|| "user".to_string())).source,
-            Some("user".to_string())
+            s.entries[0].source.as_deref(),
+            Some("/Users/me/src/api/.envy")
         );
     }
 
@@ -203,18 +162,26 @@ mod tests {
                 _ => None,
             };
             let prev = ActiveState::from_env(env);
-            assert_eq!(prev.source, None, "{bad:?}");
+            assert_eq!(prev.entries[0].source, None, "{bad:?}");
             // The previous source never reaches shell code.
             let out = render_activate(&work(), "user", &prev, &store_with_c()).unwrap();
             assert!(!out.contains("id)") && !out.contains("unset PATH"), "{out}");
             assert!(!render_off(&prev).contains("id)"));
         }
         // The longest value accepted.
+        let with_source = |source: String| {
+            ActiveState::from_env(|k| match k {
+                "ENVY_ACTIVE" => Some("work".to_string()),
+                "ENVY_SOURCE" => Some(source.clone()),
+                _ => None,
+            })
+        };
         let long = "x".repeat(4096);
-        let s = ActiveState::from_env(|k| (k == "ENVY_SOURCE").then(|| long.clone()));
-        assert_eq!(s.source.as_deref(), Some(long.as_str()));
-        let s = ActiveState::from_env(|k| (k == "ENVY_SOURCE").then(|| "x".repeat(4097)));
-        assert_eq!(s.source, None);
+        assert_eq!(
+            with_source(long.clone()).entries[0].source.as_deref(),
+            Some(long.as_str())
+        );
+        assert_eq!(with_source("x".repeat(4097)).entries[0].source, None);
     }
 
     #[test]
@@ -241,7 +208,7 @@ mod tests {
             _ => None,
         };
         let prev = ActiveState::from_env(env);
-        assert_eq!(prev.vars, ["B", "C"]);
+        assert_eq!(prev.all_vars(), ["B", "C"]);
         let second = render_activate(&work(), "user", &prev, &store).unwrap();
         assert_eq!(second, format!("unset B C\n{first}"));
     }
@@ -276,8 +243,8 @@ mod tests {
             _ => None,
         };
         let s = ActiveState::from_env(env);
-        assert_eq!(s.vars, ["A", "C"]);
-        assert_eq!(s.namespace, None);
+        assert_eq!(s.all_vars(), ["A", "C"]);
+        assert!(s.entries.is_empty());
     }
 
     #[test]
@@ -286,18 +253,31 @@ mod tests {
             "ENVY_ACTIVE" => Some("x; rm -rf ~".to_string()),
             _ => None,
         };
-        assert_eq!(ActiveState::from_env(env).namespace, None);
+        assert!(ActiveState::from_env(env).entries.is_empty());
     }
 
     #[test]
     fn off_output_matches_format() {
         assert_eq!(
             render_off(&state(&["A", "B"])),
-            "unset A B\nunset ENVY_ACTIVE ENVY_SOURCE ENVY_VARS\n"
+            "unset A B\nunset ENVY_ACTIVE ENVY_SOURCE ENVY_STACK ENVY_VARS\n"
         );
         assert_eq!(
             render_off(&ActiveState::default()),
-            "unset ENVY_ACTIVE ENVY_SOURCE ENVY_VARS\n"
+            "unset ENVY_ACTIVE ENVY_SOURCE ENVY_STACK ENVY_VARS\n"
+        );
+    }
+
+    #[test]
+    fn off_leaves_no_stack_variable_behind() {
+        let stacked = ActiveState::from_env(|k| match k {
+            "ENVY_STACK" => Some("a\u{1f}user\u{1f}A\u{1e}b\u{1f}\u{1f}B".to_string()),
+            "ENVY_VARS" => Some("A B C".to_string()),
+            _ => None,
+        });
+        assert_eq!(
+            render_off(&stacked),
+            "unset A B C\nunset ENVY_ACTIVE ENVY_SOURCE ENVY_STACK ENVY_VARS\n"
         );
     }
 

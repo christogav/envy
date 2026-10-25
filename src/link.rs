@@ -502,10 +502,10 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use crate::activate::ActiveState;
     use crate::commands::{SetItem, activate, create, set_vars};
     use crate::prompt::{Asked, Prompter, ScriptedPrompter};
     use crate::secret::Secret;
+    use crate::stack::ActiveState;
     use crate::store::{MemoryStore, SecretStore};
 
     fn config_with(files: &[(&str, &str)]) -> (tempfile::TempDir, Config) {
