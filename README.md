@@ -6,6 +6,14 @@
   and flip to another set without leaving a trace of the first.
 </p>
 
+<p align="center">
+  <a href="https://github.com/christogav/envy/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/christogav/envy/ci.yml?branch=main&label=CI"></a>
+  <a href="https://github.com/christogav/envy/actions/workflows/deny.yml"><img alt="Dependency checks" src="https://img.shields.io/github/actions/workflow/status/christogav/envy/deny.yml?branch=main&label=dependencies"></a>
+  <a href="https://github.com/christogav/envy/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/christogav/envy"></a>
+  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/github/license/christogav/envy"></a>
+  <img alt="Platform: macOS, zsh" src="https://img.shields.io/badge/platform-macOS%20%C2%B7%20zsh-lightgrey">
+</p>
+
 ```console
 $ envy work         # GITHUB_TOKEN, AWS_PROFILE, ... are now set in this shell
 $ envy personal     # work's variables are gone, personal's are set
