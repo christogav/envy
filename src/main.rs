@@ -111,6 +111,17 @@ fn run(command: Command) -> Result<String> {
             check_emit()?;
             Ok(render_off(&active_state()))
         }
+        Action::OffNamed(ns) => {
+            // The output holds secret exports (restored values).
+            check_emit()?;
+            let here = Here::discover()?;
+            let activation =
+                commands::deactivate(&MacKeychain, &here.levels, &ns, &active_state())?;
+            for note in &activation.notes {
+                eprintln!("{note}");
+            }
+            Ok(activation.stdout)
+        }
         Action::Activate(ns) => {
             // Refuse before the config, the Keychain or the filesystem is read.
             check_emit()?;

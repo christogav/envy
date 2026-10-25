@@ -104,10 +104,42 @@ pub fn activate(ctx: &Ctx, levels: &Levels, ns: &str, prev: &ActiveState) -> Res
     // user entered and confirmed them, and a read failure does not roll
     // either back.
     let mut values = read_values(&file, ctx.store)?;
-    let (restored, unrestored) = restore_values(levels, ctx.store, &t.next, &t.export, Some(ns))?;
+    let (restored, unrestored) = restore_values(
+        levels,
+        ctx.store,
+        &t.next,
+        &t.export,
+        Some(ns),
+        Restoring::Activation,
+    )?;
     values.extend(restored);
     let mut notes: Vec<String> = t.warnings.iter().map(warning_text).collect();
     notes.extend(unrestored);
+    Ok(Activation {
+        stdout: render_transition(&t, &values),
+        notes,
+    })
+}
+
+/// Removes namespace `ns` from the stack `prev` (`envy --off <ns>`): unsets
+/// the variables only it defined and restores those it was shadowing from
+/// the next namespace that defines them ([`restore_values`]: re-read, trust
+/// checked, never prompting). `ns` is not active: an `Err` naming it, and
+/// nothing changes. Every value is read before any output is built.
+pub fn deactivate(
+    store: &dyn SecretStore,
+    levels: &Levels,
+    ns: &str,
+    prev: &ActiveState,
+) -> Result<Activation> {
+    let t = transition(
+        prev,
+        &StackChange::Remove {
+            namespace: ns.to_string(),
+        },
+    )?;
+    let (values, notes) =
+        restore_values(levels, store, &t.next, &t.export, None, Restoring::Removal)?;
     Ok(Activation {
         stdout: render_transition(&t, &values),
         notes,
@@ -159,6 +191,16 @@ fn warning_text(warning: &Warning) -> String {
     }
 }
 
+/// Why variables are being restored: it only changes the wording of the notes
+/// that tell the user how to get an unrestored variable back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Restoring {
+    /// Activating a namespace replaced an entry that shadowed them.
+    Activation,
+    /// `envy --off <name>` removed the entry that shadowed them.
+    Removal,
+}
+
 /// The values of `exports` (each owned, in `state`, by the namespace it
 /// names), except those of namespace `skip`, whose values the caller reads
 /// itself. Each owner is re-read from the level its entry records, found
@@ -178,6 +220,7 @@ pub fn restore_values(
     state: &ActiveState,
     exports: &[Export],
     skip: Option<&str>,
+    why: Restoring,
 ) -> Result<(BTreeMap<String, String>, Vec<String>)> {
     let mut values = BTreeMap::new();
     // Per reason, the variables it leaves unset, in order.
@@ -186,7 +229,7 @@ pub fn restore_values(
         if skip == Some(export.from.as_str()) {
             continue;
         }
-        match restore_one(levels, store, state, export)? {
+        match restore_one(levels, store, state, export, why)? {
             Ok(text) => {
                 values.insert(export.var.clone(), text);
             }
@@ -210,25 +253,38 @@ fn restore_one(
     store: &dyn SecretStore,
     state: &ActiveState,
     export: &Export,
+    why: Restoring,
 ) -> Result<std::result::Result<String, String>> {
     let ns = export.from.as_str();
     let var = export.var.as_str();
-    let gone = || Ok(Err(format!("namespace {ns:?} no longer defines them")));
     // The exact entry that wins the variable: a tampered state may hold the
-    // name more than once.
-    let Some(owner) = state.winner(var).filter(|e| e.namespace == ns) else {
-        return gone();
+    // name more than once. Callers pass the state the exports were computed
+    // from, so its winner is always the export's owner.
+    let owner = state.winner(var).filter(|e| e.namespace == ns);
+    debug_assert!(owner.is_some(), "export of {var} does not match the state");
+    let Some(owner) = owner else {
+        return Ok(Err(format!(
+            "internal error: {var} is not owned by namespace {ns:?} in the active state"
+        )));
     };
     let Some(source) = owner.source.as_deref() else {
+        let how = match why {
+            Restoring::Activation => format!("run envy {ns} to load it again"),
+            Restoring::Removal => "run envy --off to remove everything".to_string(),
+        };
         return Ok(Err(format!(
-            "namespace {ns:?} was loaded by an older envy, so its level is unknown; \
-             run envy {ns} to load it again"
+            "namespace {ns:?} was loaded by an older envy, so its level is unknown; {how}"
         )));
     };
     let Some(cfg) = levels.config_for(source) else {
+        let how = match why {
+            Restoring::Activation => format!("run envy {ns} in that project to load it again"),
+            Restoring::Removal => {
+                format!("run envy --off {ns} from that project's folder to remove it")
+            }
+        };
         return Ok(Err(format!(
-            "namespace {ns:?} was loaded from {source}, which is not visible from this folder; \
-             run envy {ns} in that project to load it again"
+            "namespace {ns:?} was loaded from {source}, which is not visible from this folder; {how}"
         )));
     };
     let Ok(file) = cfg.load(ns) else {
@@ -250,7 +306,7 @@ fn restore_one(
         }
     }
     let Some(value) = file.get(var) else {
-        return gone();
+        return Ok(Err(format!("namespace {ns:?} no longer defines them")));
     };
     Ok(read_value(&file, var, &value, store)
         .with_context(|| format!("cannot restore {var} from namespace {ns}"))?
@@ -5859,6 +5915,171 @@ mod tests {
                 "note: left unset: X, Y (namespace \"dev\" was loaded by an older envy, so its level is unknown; run envy dev to load it again)"
             ]
         );
+    }
+
+    fn deactivate_in(
+        s: &StackLevels,
+        store: &dyn SecretStore,
+        ns: &str,
+        prev: &ActiveState,
+    ) -> Result<Activation> {
+        deactivate(store, &s.levels, ns, prev)
+    }
+
+    #[test]
+    fn off_one_removes_only_that_namespace() {
+        let s = stack_levels(&[], &[]);
+        let store = MemoryStore::default();
+        let prev = stack_of(&[
+            ("base", "user", &["A"]),
+            ("mid", "user", &["M", "N"]),
+            ("top", "user", &["T"]),
+        ]);
+        let out = deactivate_in(&s, &store, "mid", &prev).unwrap();
+        let next = stack_of(&[("base", "user", &["A"]), ("top", "user", &["T"])]);
+        assert_eq!(out.stdout, format!("unset M N\n{}", next.state_exports()));
+        assert!(out.notes.is_empty(), "{:?}", out.notes);
+        // The last one left: the state is cleared, as plain --off does.
+        let out =
+            deactivate_in(&s, &store, "only", &stack_of(&[("only", "user", &["O"])])).unwrap();
+        assert_eq!(
+            out.stdout,
+            format!("unset O\n{}", ActiveState::default().state_exports())
+        );
+    }
+
+    #[test]
+    fn off_one_restores_the_shadowed_value() {
+        let s = stack_levels(
+            &[
+                ("base", "[vars]\nX = \"base-x\"\nK = \"@keychain\"\n"),
+                ("work", "[vars]\nX = \"work-x\"\nW = \"w\"\n"),
+            ],
+            &[],
+        );
+        let store = store_of(&[("base", "K", "base-k")]);
+        let prev = stack_of(&[("base", "user", &["X", "K"]), ("work", "user", &["X", "W"])]);
+        let out = deactivate_in(&s, &store, "work", &prev).unwrap();
+        let next = stack_of(&[("base", "user", &["X", "K"])]);
+        assert_eq!(
+            out.stdout,
+            format!("unset W\n{}export X='base-x'\n", next.state_exports())
+        );
+        assert!(out.notes.is_empty(), "{:?}", out.notes);
+        // Removing the loser changes no value.
+        let out = deactivate_in(&s, &store, "base", &prev).unwrap();
+        let next = stack_of(&[("work", "user", &["X", "W"])]);
+        assert_eq!(out.stdout, format!("unset K\n{}", next.state_exports()));
+    }
+
+    #[test]
+    fn off_one_never_reads_an_untrusted_project_file_and_names_the_folder_when_not_visible() {
+        let s = stack_levels(
+            &[("work", "[vars]\nX = \"w\"\n")],
+            &[("base", "[vars]\nX = \"zq-pulled\"\nY = \"y\"\n")],
+        );
+        let store = MemoryStore::default();
+        let here = label(&s.proj);
+        // base was never confirmed here: not read, left unset, said so.
+        let prev = stack_of(&[("base", here.as_str(), &["X"]), ("work", "user", &["X"])]);
+        let out = deactivate_in(&s, &store, "work", &prev).unwrap();
+        assert!(out.stdout.starts_with("unset X\n"), "{}", out.stdout);
+        assert!(!out.stdout.contains("zq-"), "{}", out.stdout);
+        assert_eq!(
+            out.notes,
+            [format!(
+                "note: left unset: X (project namespace \"base\" in {here} is not confirmed; run envy base there to review it)"
+            )]
+        );
+        // An entry from a folder that is not visible: say where to run --off.
+        let prev = stack_of(&[
+            ("dev", "/Users/me/elsewhere/.envy", &["X"]),
+            ("work", "user", &["X"]),
+        ]);
+        let out = deactivate_in(&s, &store, "work", &prev).unwrap();
+        assert_eq!(
+            out.notes,
+            [
+                "note: left unset: X (namespace \"dev\" was loaded from /Users/me/elsewhere/.envy, which is not visible from this folder; run envy --off dev from that project's folder to remove it)"
+            ]
+        );
+    }
+
+    #[test]
+    fn off_of_an_inactive_name_fails_and_changes_nothing() {
+        let s = stack_levels(&[("base", "[vars]\nA = \"1\"\n")], &[]);
+        let store = store_of(&[("base", "K", "zq-k")]);
+        let before = store.snapshot();
+        let prev = stack_of(&[("base", "user", &["A"])]);
+        let err = deactivate_in(&s, &store, "nope", &prev).unwrap_err();
+        assert_eq!(err.to_string(), "nope is not active");
+        assert_eq!(store.snapshot(), before);
+    }
+
+    #[test]
+    fn a_failed_secret_read_on_removal_prints_nothing() {
+        let s = stack_levels(&[("base", "[vars]\nK = \"@keychain\"\n")], &[]);
+        let store = FailingGet {
+            inner: store_of(&[("base", "K", "zq-base-k")]),
+            fail_on: "K",
+        };
+        let prev = stack_of(&[("base", "user", &["K"]), ("work", "user", &["K"])]);
+        let err = deactivate_in(&s, &store, "work", &prev).unwrap_err();
+        let msg = format!("{err:#} {err:?}");
+        assert!(msg.contains('K') && !msg.contains("zq-"), "{msg}");
+    }
+
+    #[test]
+    fn off_all_still_clears_everything_from_a_damaged_stack() {
+        // Per-entry data is gone; only the flat union of names is left.
+        let damaged = ActiveState::from_env(|k| match k {
+            "ENVY_STACK" => Some("\u{1f}\u{1f}garbage;rm -rf".to_string()),
+            "ENVY_VARS" => Some("A B bad;name C".to_string()),
+            _ => None,
+        });
+        let out = crate::activate::render_off(&damaged);
+        assert_eq!(
+            out,
+            format!(
+                "unset {}\n{}",
+                damaged.all_vars().join(" "),
+                ActiveState::default().state_exports()
+            )
+        );
+        assert!(out.starts_with("unset A B C\n"), "{out}");
+    }
+
+    #[test]
+    fn restore_with_duplicate_names_in_state_reads_the_matching_owner() {
+        let s = stack_levels(
+            &[("dup", "[vars]\nX = \"user-x\"\n")],
+            &[("dup", "[vars]\nX = \"proj-x\"\n")],
+        );
+        trust_now(&s.proj, "dup");
+        let here = label(&s.proj);
+        let store = MemoryStore::default();
+        // The same name from two levels (tampered state); the last one wins X.
+        for (first, second, want) in [
+            ("user", here.as_str(), "proj-x"),
+            (here.as_str(), "user", "user-x"),
+        ] {
+            let state = stack_of(&[("dup", first, &["X"]), ("dup", second, &["X"])]);
+            let export = Export {
+                var: "X".into(),
+                from: "dup".into(),
+            };
+            let (values, notes) = restore_values(
+                &s.levels,
+                &store,
+                &state,
+                &[export],
+                None,
+                Restoring::Removal,
+            )
+            .unwrap();
+            assert_eq!(values.get("X").map(String::as_str), Some(want));
+            assert!(notes.is_empty(), "{notes:?}");
+        }
     }
 
     /// A store whose `get` fails for one variable name.
