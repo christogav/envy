@@ -25,6 +25,7 @@
 
 use crate::names::{validate_namespace, validate_var};
 use crate::quote::shell_quote;
+use anyhow::{Result, bail};
 
 /// The longest level label accepted back from the environment.
 const MAX_SOURCE: usize = 4096;
@@ -174,6 +175,135 @@ impl ActiveState {
             shell_quote(&self.all_vars().join(" ")),
         )
     }
+}
+
+/// A change to the stack.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Change {
+    /// Push `entry` on top, first removing every entry with its name and each
+    /// namespace in `replaces` (its linked alternatives).
+    Add {
+        entry: Entry,
+        replaces: Vec<String>,
+    },
+    Remove {
+        namespace: String,
+    },
+    Clear,
+}
+
+/// A variable to (re)export, and the namespace that wins it afterwards.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Export {
+    pub var: String,
+    pub from: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Warning {
+    Collision {
+        var: String,
+        winner: String,
+        shadowed: String,
+    },
+}
+
+/// What a change does: the next state and the shell work to get there.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Transition {
+    pub next: ActiveState,
+    pub unset: Vec<String>,
+    pub export: Vec<Export>,
+    pub warnings: Vec<Warning>,
+}
+
+/// Works out the next state and the shell work to reach it from `prev`.
+///
+/// State read from the environment may hold one name more than once, so a
+/// same-name change acts on every entry with that name. Per variable, the
+/// previous winner is compared with the next: no owner means unset, a new or
+/// different winner means export from it. Every variable of an added entry is
+/// exported again (a refresh may carry new values).
+pub fn transition(prev: &ActiveState, change: &Change) -> Result<Transition> {
+    let mut entries = prev.entries.clone();
+    let mut added: Option<&Entry> = None;
+    match change {
+        Change::Add { entry, replaces } => {
+            entries.retain(|e| e.namespace != entry.namespace && !replaces.contains(&e.namespace));
+            added = Some(entry);
+        }
+        Change::Remove { namespace } => {
+            if prev.entry(namespace).is_none() {
+                bail!("{namespace} is not active");
+            }
+            entries.retain(|e| &e.namespace != namespace);
+        }
+        Change::Clear => entries.clear(),
+    }
+
+    let mut warnings = Vec::new();
+    if let Some(entry) = added {
+        for var in &entry.vars {
+            if let Some(shadowed) = entries
+                .iter()
+                .rev()
+                .find(|e| e.vars.contains(var))
+                .map(|e| e.namespace.clone())
+            {
+                warnings.push(Warning::Collision {
+                    var: var.clone(),
+                    winner: entry.namespace.clone(),
+                    shadowed,
+                });
+            }
+        }
+        entries.push(entry.clone());
+    }
+
+    let mut next = ActiveState {
+        entries,
+        extra_vars: Vec::new(),
+    };
+    // Unowned recorded names stay recorded (and set) until nothing is left.
+    if !next.entries.is_empty() {
+        next.extra_vars = prev
+            .extra_vars
+            .iter()
+            .filter(|v| next.winner(v).is_none())
+            .cloned()
+            .collect();
+    }
+
+    let mut unset = Vec::new();
+    let mut export = Vec::new();
+    let mut seen = prev.all_vars();
+    for var in next.all_vars() {
+        if !seen.contains(&var) {
+            seen.push(var);
+        }
+    }
+    for var in seen {
+        match next.winner(&var) {
+            None if next.extra_vars.contains(&var) => {}
+            None => unset.push(var),
+            Some(winner) => {
+                let refreshed = added.is_some_and(|e| e.vars.contains(&var));
+                let changed = prev.winner(&var).map(|e| &e.namespace) != Some(&winner.namespace);
+                if refreshed || changed {
+                    export.push(Export {
+                        var,
+                        from: winner.namespace.clone(),
+                    });
+                }
+            }
+        }
+    }
+    Ok(Transition {
+        next,
+        unset,
+        export,
+        warnings,
+    })
 }
 
 #[cfg(test)]
@@ -332,5 +462,219 @@ mod tests {
         assert_eq!(s.entry("b").unwrap().namespace, "b");
         assert!(s.entry("c").is_none());
         assert_eq!(s.all_vars(), ["X", "Y", "Z"]);
+    }
+
+    fn state(entries: &[(&str, &[&str])]) -> ActiveState {
+        ActiveState {
+            entries: entries.iter().map(|(n, v)| entry(n, None, v)).collect(),
+            extra_vars: vec![],
+        }
+    }
+
+    fn add(prev: &ActiveState, ns: &str, vars: &[&str], replaces: &[&str]) -> Transition {
+        let change = Change::Add {
+            entry: entry(ns, Some("user"), vars),
+            replaces: replaces.iter().map(|r| r.to_string()).collect(),
+        };
+        transition(prev, &change).unwrap()
+    }
+
+    fn remove(prev: &ActiveState, ns: &str) -> Transition {
+        transition(
+            prev,
+            &Change::Remove {
+                namespace: ns.to_string(),
+            },
+        )
+        .unwrap()
+    }
+
+    fn exp(var: &str, from: &str) -> Export {
+        Export {
+            var: var.into(),
+            from: from.into(),
+        }
+    }
+
+    fn names(s: &ActiveState) -> Vec<&str> {
+        s.entries.iter().map(|e| e.namespace.as_str()).collect()
+    }
+
+    #[test]
+    fn add_to_empty_exports_every_var() {
+        let t = add(&ActiveState::default(), "a", &["X", "Y"], &[]);
+        assert_eq!(t.export, [exp("X", "a"), exp("Y", "a")]);
+        assert!(t.unset.is_empty() && t.warnings.is_empty());
+        assert_eq!(names(&t.next), ["a"]);
+    }
+
+    #[test]
+    fn add_pushes_on_top_and_keeps_others() {
+        let t = add(&state(&[("a", &["X"])]), "b", &["Y"], &[]);
+        assert_eq!(names(&t.next), ["a", "b"]);
+        assert_eq!(t.export, [exp("Y", "b")]);
+        assert!(t.unset.is_empty());
+    }
+
+    #[test]
+    fn add_with_the_same_name_replaces_and_moves_to_top() {
+        let prev = ActiveState {
+            entries: vec![
+                entry("a", Some("/old/.envy"), &["X"]),
+                entry("b", None, &["Y"]),
+            ],
+            extra_vars: vec![],
+        };
+        let t = add(&prev, "a", &["X"], &[]);
+        assert_eq!(names(&t.next), ["b", "a"]);
+        assert_eq!(t.next.entries[1].source.as_deref(), Some("user"));
+        // The value may have changed, so it is exported again.
+        assert_eq!(t.export, [exp("X", "a")]);
+        assert!(t.unset.is_empty() && t.warnings.is_empty());
+    }
+
+    #[test]
+    fn add_replaces_the_named_linked_entries() {
+        let prev = state(&[("work", &["X", "Y"]), ("other", &["Z"])]);
+        let t = add(&prev, "personal", &["X"], &["work"]);
+        assert_eq!(names(&t.next), ["other", "personal"]);
+        assert_eq!(t.export, [exp("X", "personal")]);
+        assert_eq!(t.unset, ["Y"]);
+        assert!(t.warnings.is_empty());
+    }
+
+    #[test]
+    fn a_collision_warns_naming_var_winner_and_shadowed() {
+        let t = add(&state(&[("a", &["X", "Y"])]), "b", &["X"], &[]);
+        assert_eq!(
+            t.warnings,
+            [Warning::Collision {
+                var: "X".into(),
+                winner: "b".into(),
+                shadowed: "a".into()
+            }]
+        );
+        assert_eq!(t.export, [exp("X", "b")]);
+    }
+
+    #[test]
+    fn no_warning_without_overlap() {
+        let t = add(&state(&[("a", &["X"])]), "b", &["Y"], &[]);
+        assert!(t.warnings.is_empty());
+    }
+
+    #[test]
+    fn removing_the_winner_exports_the_shadowed_value_from_the_next_owner() {
+        let prev = state(&[("a", &["X"]), ("b", &["X", "Y"])]);
+        let t = remove(&prev, "b");
+        assert_eq!(t.export, [exp("X", "a")]);
+        assert_eq!(t.unset, ["Y"]);
+        assert_eq!(names(&t.next), ["a"]);
+    }
+
+    #[test]
+    fn removing_the_loser_changes_no_exports() {
+        let prev = state(&[("a", &["X"]), ("b", &["X"])]);
+        let t = remove(&prev, "a");
+        assert!(t.export.is_empty() && t.unset.is_empty());
+        assert_eq!(names(&t.next), ["b"]);
+    }
+
+    #[test]
+    fn removing_the_middle_of_three() {
+        let prev = state(&[("a", &["X"]), ("b", &["X", "Y"]), ("c", &["Y"])]);
+        let t = remove(&prev, "b");
+        // b won X over a, so a's X comes back; c still wins Y.
+        assert_eq!(t.export, [exp("X", "a")]);
+        assert!(t.unset.is_empty());
+        assert_eq!(names(&t.next), ["a", "c"]);
+        let t = remove(&prev, "c");
+        assert_eq!(t.export, [exp("Y", "b")]);
+    }
+
+    #[test]
+    fn removing_the_only_owner_unsets_the_var() {
+        let prev = state(&[("a", &["X"]), ("b", &["Y"])]);
+        let t = remove(&prev, "b");
+        assert_eq!(t.unset, ["Y"]);
+        assert!(t.export.is_empty());
+    }
+
+    #[test]
+    fn refresh_that_drops_a_var_restores_the_lower_owner() {
+        let prev = state(&[("a", &["X"]), ("b", &["X", "Y"])]);
+        let t = add(&prev, "b", &["Y"], &[]);
+        assert_eq!(names(&t.next), ["a", "b"]);
+        assert!(t.export.contains(&exp("X", "a")));
+        assert!(t.export.contains(&exp("Y", "b")));
+        assert!(t.unset.is_empty());
+        let dropped = add(&state(&[("b", &["X", "Y"])]), "b", &["Y"], &[]);
+        assert_eq!(dropped.unset, ["X"]);
+    }
+
+    #[test]
+    fn remove_of_an_inactive_name_errors_and_names_it() {
+        let err = transition(
+            &state(&[("a", &["X"])]),
+            &Change::Remove {
+                namespace: "nope".into(),
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err.to_string(), "nope is not active");
+    }
+
+    #[test]
+    fn clear_unsets_every_recorded_var_including_extras() {
+        let mut prev = state(&[("a", &["X"]), ("b", &["X", "Y"])]);
+        prev.extra_vars = vec!["Z".into()];
+        let t = transition(&prev, &Change::Clear).unwrap();
+        assert_eq!(t.unset, ["X", "Y", "Z"]);
+        assert!(t.export.is_empty());
+        assert_eq!(t.next, ActiveState::default());
+    }
+
+    #[test]
+    fn extras_are_carried_over_until_everything_is_removed() {
+        let mut prev = state(&[("a", &["X"]), ("b", &["Y"])]);
+        prev.extra_vars = vec!["Z".into()];
+        let t = remove(&prev, "b");
+        assert_eq!(t.next.extra_vars, ["Z"]);
+        assert_eq!(t.unset, ["Y"]);
+        let t = remove(&t.next, "a");
+        assert_eq!(t.unset, ["X", "Z"]);
+        assert_eq!(t.next, ActiveState::default());
+    }
+
+    #[test]
+    fn unset_never_lists_a_var_that_still_has_an_owner() {
+        let mut prev = state(&[("a", &["X", "W"]), ("b", &["X", "Y"])]);
+        prev.extra_vars = vec!["Z".into()];
+        for t in [
+            remove(&prev, "a"),
+            remove(&prev, "b"),
+            add(&prev, "b", &["Q"], &[]),
+            add(&prev, "c", &["W"], &["a", "b"]),
+        ] {
+            for var in &t.unset {
+                assert!(t.next.winner(var).is_none(), "{var} still owned");
+                assert!(!t.next.extra_vars.contains(var), "{var} still recorded");
+            }
+            for e in &t.export {
+                assert_eq!(t.next.winner(&e.var).unwrap().namespace, e.from);
+            }
+        }
+    }
+
+    #[test]
+    fn duplicate_names_are_all_removed_by_add_and_remove() {
+        let prev = state(&[("a", &["X"]), ("b", &["Y"]), ("a", &["Z"])]);
+        let t = remove(&prev, "a");
+        assert_eq!(names(&t.next), ["b"]);
+        assert_eq!(t.unset, ["X", "Z"]);
+        let t = add(&prev, "a", &["W"], &[]);
+        assert_eq!(names(&t.next), ["b", "a"]);
+        assert_eq!(t.unset, ["X", "Z"]);
+        assert_eq!(t.export, [exp("W", "a")]);
     }
 }
