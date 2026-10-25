@@ -13,7 +13,7 @@
 ///   it the binary refuses to print export lines, so a script that runs it
 ///   with stdout sent to a file cannot write secrets there.
 /// - Only a single non-flag argument (a namespace), exactly `--off`, or
-///   `--user` with one non-flag word (either order) is evaluated.
+///   `--user` or `--off` with one non-flag word (either order) is evaluated.
 ///   [`wrapper_evaluates`] mirrors this; a test keeps it and the parser in
 ///   agreement. Everything else (`envy`, `envy --help`, `envy --init zsh`,
 ///   `envy work --edit`, `envy work --secret A B`, ...) runs the binary directly
@@ -28,7 +28,7 @@ pub fn zsh_function() -> &'static str {
     r#"envy() {
   \builtin emulate -L zsh
   \builtin unsetopt xtrace
-  if [[ $# -eq 1 && ( $1 == --off || $1 != -* ) ]] || [[ $# -eq 2 && ( ( $1 == --user && $2 != -* ) || ( $2 == --user && $1 != -* ) ) ]]; then
+  if [[ $# -eq 1 && ( $1 == --off || $1 != -* ) ]] || [[ $# -eq 2 && ( ( ( $1 == --user || $1 == --off ) && $2 != -* ) || ( ( $2 == --user || $2 == --off ) && $1 != -* ) ) ]]; then
     \builtin eval "$(ENVY_EVAL=1 \command envy "$@" || \builtin print -r -- 'return 1')"
   else
     \command envy "$@"
@@ -40,12 +40,15 @@ pub fn zsh_function() -> &'static str {
 /// Whether the shell function evaluates the binary's output for `args`
 /// (the arguments after `envy`). Mirrors the condition in [`zsh_function`]:
 /// one argument that is `--off` or a non-flag word, or two arguments that
-/// are `--user` and a non-flag word in either order.
+/// are `--user` or `--off` and a non-flag word in either order.
 pub fn wrapper_evaluates(args: &[String]) -> bool {
     let word = |a: &String| !a.starts_with('-');
     match args {
         [a] => a == "--off" || word(a),
-        [a, b] => (a == "--user" && word(b)) || (b == "--user" && word(a)),
+        [a, b] => {
+            let flag = |f: &String| f == "--user" || f == "--off";
+            (flag(a) && word(b)) || (flag(b) && word(a))
+        }
         _ => false,
     }
 }
@@ -55,7 +58,7 @@ mod tests {
     use super::*;
 
     /// The condition as it must appear in the function text.
-    const CONDITION: &str = "[[ $# -eq 1 && ( $1 == --off || $1 != -* ) ]] || [[ $# -eq 2 && ( ( $1 == --user && $2 != -* ) || ( $2 == --user && $1 != -* ) ) ]]";
+    const CONDITION: &str = "[[ $# -eq 1 && ( $1 == --off || $1 != -* ) ]] || [[ $# -eq 2 && ( ( ( $1 == --user || $1 == --off ) && $2 != -* ) || ( ( $2 == --user || $2 == --off ) && $1 != -* ) ) ]]";
 
     #[test]
     fn function_is_hardened_and_does_not_store_output() {
@@ -79,6 +82,8 @@ mod tests {
             &["--off"],
             &["dev", "--user"],
             &["--user", "dev"],
+            &["--off", "dev"],
+            &["dev", "--off"],
         ] {
             assert!(w(yes), "{yes:?}");
         }
@@ -93,6 +98,10 @@ mod tests {
             &["dev", "--list"],
             &["a", "b"],
             &["dev", "--user", "x"],
+            &["--off", "--user"],
+            &["--off", "a", "b"],
+            &["--off", "-x"],
+            &["--off", "dev", "--user"],
         ] {
             assert!(!w(no), "{no:?}");
         }

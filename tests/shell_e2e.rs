@@ -899,6 +899,10 @@ fn check_wrapper(prelude: &str) {
         &["a b"],
         &["*", "--user"],
         &["--user", "a b"],
+        &["--off", "dev"],
+        &["dev", "--off"],
+        &["--off", "*"],
+        &["a b", "--off"],
     ];
     let shown: &[&[&str]] = &[
         &["dev", "--user", "--list"],
@@ -911,6 +915,10 @@ fn check_wrapper(prelude: &str) {
         &["dev", "--new", "--project"],
         &["*", "--list"],
         &["a b", "--list"],
+        &["--off", "--user"],
+        &["--off", "a", "b"],
+        &["--off", "-x"],
+        &["--off", "dev", "--user"],
     ];
     let all: Vec<&[&str]> = evaluated.iter().chain(shown).copied().collect();
     let (lines, seen) = wrapper_outcomes_with(prelude, &all);
@@ -1601,5 +1609,194 @@ fn e2e_a_user_config_dir_named_envy_is_still_the_user_level() {
     let out = p.zsh(&dots, &script);
     assert!(out.status.success(), "{}", stderr(&out));
     assert_eq!(stdout(&out), "user|user\n* dev\n");
+    assert_eq!(stderr(&out), "");
+}
+
+// ---- stacking ----
+
+#[test]
+fn stack_two_namespaces_and_both_are_set() {
+    let dir = fixture();
+    let out = zsh(
+        dir.path(),
+        r#"envy work
+envy personal
+print -r -- "$AWS_REGION|$ONLY_PERSONAL|$ENVY_ACTIVE|$ENVY_VARS"
+"#,
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(
+        stdout(&out),
+        "eu-west-1|p|work personal|AWS_REGION TAG ONLY_PERSONAL\n"
+    );
+    assert_eq!(stderr(&out), "");
+}
+
+#[test]
+fn a_collision_warns_on_stderr_and_the_later_wins() {
+    let dir = fixture();
+    std::fs::write(
+        dir.path().join("eu.toml"),
+        "[vars]\nAWS_REGION = \"zq-other-region\"\n",
+    )
+    .unwrap();
+    for (order, winner, loser) in [
+        ("work\nenvy eu", "zq-other-region", "work"),
+        ("eu\nenvy work", "eu-west-1", "eu"),
+    ] {
+        let out = zsh(
+            dir.path(),
+            &format!("envy {order}\nprint -r -- \"$AWS_REGION\"\n"),
+        );
+        assert!(out.status.success(), "{}", stderr(&out));
+        assert_eq!(stdout(&out), format!("{winner}\n"));
+        let err = stderr(&out);
+        assert!(
+            err.starts_with("warning: AWS_REGION is set by both")
+                && err.contains("wins (it was activated last)"),
+            "{err}"
+        );
+        assert!(err.contains(loser), "{err}");
+        assert!(
+            !err.contains("zq-other-region") && !err.contains("eu-west-1"),
+            "{err}"
+        );
+    }
+}
+
+#[test]
+fn off_one_restores_and_keeps_the_other() {
+    let dir = fixture();
+    std::fs::write(
+        dir.path().join("eu.toml"),
+        "[vars]\nAWS_REGION = \"zq-other-region\"\nEU_ONLY = \"e\"\n",
+    )
+    .unwrap();
+    // Both forms, with the later namespace removed (the earlier one's value
+    // comes back) and with the earlier one removed (the later one keeps it).
+    for (off, region, active, only_eu, only_work) in [
+        ("envy --off eu", "eu-west-1", "work", "unset", "it's $HOME"),
+        ("envy eu --off", "eu-west-1", "work", "unset", "it's $HOME"),
+        ("envy --off work", "zq-other-region", "eu", "e", "unset"),
+        ("envy work --off", "zq-other-region", "eu", "e", "unset"),
+    ] {
+        let out = zsh(
+            dir.path(),
+            &format!(
+                "envy work\nenvy eu\n{off}\nprint -r -- \"$AWS_REGION|$ENVY_ACTIVE|${{EU_ONLY-unset}}|${{TAG-unset}}\"\n"
+            ),
+        );
+        assert!(out.status.success(), "{off}: {}", stderr(&out));
+        assert_eq!(
+            stdout(&out),
+            format!("{region}|{active}|{only_eu}|{only_work}\n"),
+            "{off}"
+        );
+        assert!(!stderr(&out).contains("zq-other-region"), "{off}");
+    }
+    // An inactive namespace is an error, and nothing changes.
+    let out = zsh(
+        dir.path(),
+        "envy work\nenvy --off personal || print -r -- \"failed:$?\"\nprint -r -- \"$ENVY_ACTIVE|$AWS_REGION\"\n",
+    );
+    assert_eq!(stdout(&out), "failed:1\nwork|eu-west-1\n");
+    assert!(stderr(&out).contains("personal"), "{}", stderr(&out));
+}
+
+#[test]
+fn plain_off_clears_all_and_the_state() {
+    let dir = fixture();
+    let out = zsh(
+        dir.path(),
+        r#"envy work
+envy personal
+envy --off
+print -r -- "${AWS_REGION-unset}|${TAG-unset}|${ONLY_PERSONAL-unset}|${ENVY_ACTIVE-unset}|${ENVY_STACK-unset}|${ENVY_VARS-unset}|${ENVY_SOURCE-unset}"
+"#,
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "unset|unset|unset|unset|unset|unset|unset\n");
+    assert_eq!(stderr(&out), "");
+}
+
+#[test]
+fn linked_switch_replaces() {
+    let dir = tempfile::tempdir().unwrap();
+    for (name, extra) in [("a", ""), ("b", "")] {
+        std::fs::write(
+            dir.path().join(format!("{name}.toml")),
+            format!("link = \"g\"\n[vars]\nREGION = \"{name}-region\"\n{extra}"),
+        )
+        .unwrap();
+    }
+    std::fs::write(dir.path().join("solo.toml"), "[vars]\nSOLO = \"s\"\n").unwrap();
+    let out = zsh(
+        dir.path(),
+        r#"envy a
+envy solo
+envy b
+print -r -- "$REGION|$SOLO|$ENVY_ACTIVE"
+"#,
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "b-region|s|solo b\n");
+    assert_eq!(stderr(&out), "");
+}
+
+#[test]
+fn a_shell_with_old_format_state_is_read_as_one_entry() {
+    let dir = fixture();
+    // Legacy single-namespace state, as an older envy left it.
+    let legacy = "export ENVY_ACTIVE=work ENVY_VARS='AWS_REGION TAG' ENVY_SOURCE=user\nexport AWS_REGION=eu-west-1 TAG=x\n";
+    let out = zsh(
+        dir.path(),
+        &format!(
+            "{legacy}envy personal\nprint -r -- \"$AWS_REGION|$ONLY_PERSONAL|$ENVY_ACTIVE|${{ENVY_SOURCE-unset}}\"\n"
+        ),
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "eu-west-1|p|work personal|unset\n");
+
+    let out = zsh(
+        dir.path(),
+        &format!(
+            "{legacy}envy --off\nprint -r -- \"${{AWS_REGION-unset}}|${{TAG-unset}}|${{ENVY_ACTIVE-unset}}|${{ENVY_VARS-unset}}|${{ENVY_SOURCE-unset}}|${{ENVY_STACK-unset}}\"\n"
+        ),
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "unset|unset|unset|unset|unset|unset\n");
+    assert_eq!(stderr(&out), "");
+}
+
+#[test]
+fn no_secret_reaches_stdout_unevaluated() {
+    let dir = fixture();
+    let log = dir.path().join("out.log");
+    for args in ["--off work", "work --off", "--off", "work"] {
+        // As in the test above: refused before the config is even read.
+        let out = Command::new("zsh")
+            .args(["-f", "-c", &format!("envy {args} > '{}'", log.display())])
+            .env_clear()
+            .env("PATH", path_with_envy())
+            .env("HOME", dir.path())
+            .env("ENVY_CONFIG_DIR", dir.path().join("work.toml"))
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(1), "{args}");
+        assert_eq!(stdout(&out), "");
+        let err = stderr(&out);
+        assert!(
+            err.starts_with("error: ") && err.contains(NOT_THROUGH_THE_FUNCTION),
+            "{args}: {err}"
+        );
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), "", "{args}");
+    }
+    // Through the function, a stack and its removal print nothing themselves.
+    let out = zsh(
+        dir.path(),
+        "envy work\nenvy personal\nenvy --off work\nenvy personal --off\n",
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "");
     assert_eq!(stderr(&out), "");
 }

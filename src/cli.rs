@@ -1291,6 +1291,12 @@ mod tests {
             &["--off=1"],
             &["-"],
             &["--user", "-"],
+            &["--off", "-x"],
+            &["-x", "--off"],
+            &["--off", "a", "b"],
+            &["--off", "dev", "--user"],
+            &["--user", "--off", "dev"],
+            &["--off", "--list"],
         ];
         assert!(table.len() >= 50);
         // A single word that is not a valid name is passed to the binary by
@@ -1314,7 +1320,7 @@ mod tests {
             let parsed = pc(args);
             let evaluated = matches!(
                 parsed.as_ref().map(|c| &c.action),
-                Ok(Action::Activate(_)) | Ok(Action::Off)
+                Ok(Action::Activate(_)) | Ok(Action::Off) | Ok(Action::OffNamed(_))
             );
             assert_eq!(
                 wrapper_evaluates(&owned),
