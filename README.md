@@ -61,7 +61,7 @@ is the better fit. envy loads by name, when you ask.
 You need macOS (Apple Silicon or Intel) and zsh.
 
 ```console
-$ brew install christogav/tap/envy
+brew install christogav/tap/envy
 ```
 
 Then add this line to `~/.zshrc` and open a new shell:
